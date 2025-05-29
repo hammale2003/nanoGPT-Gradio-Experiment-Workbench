@@ -353,6 +353,6 @@ if __name__ == "__main__":
     gradio_app_instance = create_gradio_interface()
     try:
         # share=True might require `gradio tunnel` or can be intermittent. Set to False for local-only.
-        gradio_app_instance.launch(share=False, debug=True) # Changed share to False for robustness in typical local env
+        gradio_app_instance.launch(share=True, debug=True) # Changed share to False for robustness in typical local env
     except Exception as e:
         print(f"Error launching Gradio app: {e}")
