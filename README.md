@@ -1,6 +1,7 @@
 # nanoGPT Gradio Experiment Workbench
 
-This project provides an interactive web interface using Gradio to experiment with training Andrej Karpathy's nanoGPT model. It allows users to configure model architecture, training hyperparameters, and select various optimization techniques like gradient accumulation, activation recomputation, and data parallelism, then observe the training process and results in real-time.
+This project was carried out in **the Laboratory of Complex Systems at École Centrale Casablanca**. It provides an interactive web interface using Gradio to experiment with training Andrej Karpathy's nanoGPT model. The interface allows users to configure the model architecture, set training hyperparameters, and apply various optimization techniques such as gradient accumulation, activation recomputation, and data parallelism. Users can then monitor the training process and results—such as loss curves, memory usage, and validation performance—in real-time.
+
 
 ## Features
 
