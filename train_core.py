@@ -47,9 +47,9 @@ def get_lr(it, warmup_iters_local, learning_rate_local, lr_decay_iters_local, mi
     assert 0 <= decay_ratio <= 1; coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr_local + coeff * (learning_rate_local - min_lr_local)
 
-# --- Helper function to collect GPU memory per GPU for data parallelism ---
+# --- Helper function to collect GPU memory per GPU for all parallelism types ---
 def get_gpu_memory_per_gpu():
-    """Collect GPU memory usage for each GPU when using data parallelism"""
+    """Collect GPU memory usage for each GPU when using any parallelism type"""
     if not torch.cuda.is_available():
         return {}
     
@@ -61,17 +61,27 @@ def get_gpu_memory_per_gpu():
             # Set device context and collect memory
             torch.cuda.set_device(gpu_id)
             torch.cuda.synchronize(gpu_id)  # Make sure all operations are finished
+            
+            # Get both allocated and reserved memory
             memory_allocated = torch.cuda.memory_allocated(gpu_id) / (1024 ** 3)  # Current allocation in GB
             memory_reserved = torch.cuda.memory_reserved(gpu_id) / (1024 ** 3)  # Reserved memory in GB
             
             # Use the higher of allocated or reserved memory for better tracking
             gpu_memory[gpu_id] = max(memory_allocated, memory_reserved)
+            
+            # For pipeline parallelism, we want to track even small amounts of memory usage
+            # since different GPUs might have different amounts of the model
+            
         except Exception as e:
             # If we can't access a GPU, record 0 memory usage
             gpu_memory[gpu_id] = 0.0
     
     # Restore original device
-    torch.cuda.set_device(current_device)
+    try:
+        torch.cuda.set_device(current_device)
+    except:
+        pass  # Ignore errors when restoring device
+    
     return gpu_memory
 
 # --- Default Configuration ---
@@ -281,6 +291,17 @@ def run_nanoGPT_training(
         if pipeline_parallel_size > 1:
             mode = "distributed" if dist_available else "single-process"
             yield {"type": "info", "message": f"✅ Pipeline Parallelism ENABLED - Using {pipeline_parallel_size} GPUs in {mode} mode"}
+            
+            # Report detailed pipeline device information
+            if hasattr(model, 'get_pipeline_device_info'):
+                device_info = model.get_pipeline_device_info()
+                yield {"type": "info", "message": f"📋 Pipeline device placement: {device_info}"}
+            elif hasattr(model, '_verify_device_placement'):
+                is_multi_gpu = model._verify_device_placement()
+                if is_multi_gpu:
+                    yield {"type": "info", "message": f"✅ Pipeline parallelism confirmed - model distributed across {pipeline_parallel_size} GPUs"}
+                else:
+                    yield {"type": "info", "message": f"⚠️  Pipeline parallelism setup issue - model appears to be on single device"}
         else:
             yield {"type": "info", "message": "⚠️  Pipeline Parallelism requested but using single GPU (need more GPUs)"}
     
@@ -424,5 +445,4 @@ def run_nanoGPT_training(
     yield {"type": "finished", "message": f"Training finished!", "best_val_loss": best_val_loss,
            "time_elapsed_total": final_elapsed_time, "gpu_mem_gb_max_overall": final_max_mem}
 
-
-
+S
