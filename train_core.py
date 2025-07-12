@@ -53,9 +53,24 @@ def get_gpu_memory_per_gpu():
         return {}
     
     gpu_memory = {}
+    current_device = torch.cuda.current_device()
+    
     for gpu_id in range(torch.cuda.device_count()):
-        with torch.cuda.device(gpu_id):
-            gpu_memory[gpu_id] = torch.cuda.max_memory_allocated() / (1024 ** 3)  # Convert to GB
+        try:
+            # Set device context and collect memory
+            torch.cuda.set_device(gpu_id)
+            torch.cuda.synchronize(gpu_id)  # Make sure all operations are finished
+            memory_allocated = torch.cuda.memory_allocated(gpu_id) / (1024 ** 3)  # Current allocation in GB
+            memory_reserved = torch.cuda.memory_reserved(gpu_id) / (1024 ** 3)  # Reserved memory in GB
+            
+            # Use the higher of allocated or reserved memory for better tracking
+            gpu_memory[gpu_id] = max(memory_allocated, memory_reserved)
+        except Exception as e:
+            # If we can't access a GPU, record 0 memory usage
+            gpu_memory[gpu_id] = 0.0
+    
+    # Restore original device
+    torch.cuda.set_device(current_device)
     return gpu_memory
 
 # --- Default Configuration ---
@@ -95,11 +110,27 @@ def estimate_loss(model_local, block_size_local, micro_batch_size_eval, train_da
             
             with ctx_local:
                 # Pass use_recompute=False during evaluation for faster inference
-                _, loss_output = model_local(X, Y, use_recompute=False)
+                result = model_local(X, Y, use_recompute=False)
+                
+                # Handle the case where model returns None or invalid result
+                if result is None or (isinstance(result, tuple) and len(result) < 2):
+                    losses[k] = float('nan')
+                    continue
+                
+                if isinstance(result, tuple):
+                    _, loss_output = result
+                else:
+                    # If model only returns loss (some configurations)
+                    loss_output = result
+                
+                # Check if loss_output is valid
+                if loss_output is None:
+                    losses[k] = float('nan')
+                    continue
             
             # Ensure scalar loss by averaging if it came from DataParallel
             # .mean() is a no-op if loss_output is already a scalar.
-            scalar_loss = loss_output.mean()
+            scalar_loss = loss_output.mean() if hasattr(loss_output, 'mean') else loss_output
             losses[k] = scalar_loss.item()
 
         valid_losses = losses[~torch.isnan(losses)]; out[split] = valid_losses.mean().item() if len(valid_losses) > 0 else float('nan')
@@ -124,8 +155,27 @@ def run_nanoGPT_training(
 
     # Advanced Parallelism Configuration
     num_gpus = torch.cuda.device_count()
-    pipeline_parallel_size = min(num_gpus, 2) if use_pipeline_parallel_ui and num_gpus > 1 else 1
-    tensor_parallel_size = min(num_gpus, 2) if use_tensor_parallel_ui and num_gpus > 1 else 1
+    
+    # Check if distributed is available and initialized for advanced parallelism
+    dist_available = False
+    try:
+        dist_available = torch.distributed.is_available() and torch.distributed.is_initialized()
+    except:
+        dist_available = False
+    
+    # Only enable advanced parallelism if distributed is properly initialized
+    # For single-process mode, we'll use fallback implementations
+    if dist_available:
+        pipeline_parallel_size = min(num_gpus, 2) if use_pipeline_parallel_ui and num_gpus > 1 else 1
+        tensor_parallel_size = min(num_gpus, 2) if use_tensor_parallel_ui and num_gpus > 1 else 1
+    else:
+        # In single-process mode, disable advanced parallelism that requires distributed communication
+        pipeline_parallel_size = 1
+        tensor_parallel_size = 1
+        if use_pipeline_parallel_ui and num_gpus > 1:
+            print("⚠️  Pipeline Parallelism requires distributed initialization - falling back to single-process mode")
+        if use_tensor_parallel_ui and num_gpus > 1:
+            print("⚠️  Tensor Parallelism requires distributed initialization - falling back to single-process mode")
     
     # Ensure we don't exceed available GPUs
     total_parallel_gpus = pipeline_parallel_size * tensor_parallel_size
@@ -216,16 +266,20 @@ def run_nanoGPT_training(
 
     # Parallelism status messages
     if use_tensor_parallel_ui: 
-        if tensor_parallel_size > 1:
+        if tensor_parallel_size > 1 and dist_available:
             yield {"type": "info", "message": f"✅ Tensor Parallelism ENABLED - Using {tensor_parallel_size} GPUs for tensor operations"}
+        elif not dist_available:
+            yield {"type": "info", "message": "⚠️  Tensor Parallelism requested but distributed not initialized - using single-process fallback"}
         else:
-            yield {"type": "info", "message": "⚠️  Tensor Parallelism requested but using single GPU (need more GPUs)"}
+            yield {"type": "info", "message": "⚠️  Tensor Parallelism requested but using single GPU (need more GPUs or distributed setup)"}
     
     if use_pipeline_parallel_ui: 
-        if pipeline_parallel_size > 1:
+        if pipeline_parallel_size > 1 and dist_available:
             yield {"type": "info", "message": f"✅ Pipeline Parallelism ENABLED - Using {pipeline_parallel_size} GPUs for pipeline stages"}
+        elif not dist_available:
+            yield {"type": "info", "message": "⚠️  Pipeline Parallelism requested but distributed not initialized - using single-process fallback"}
         else:
-            yield {"type": "info", "message": "⚠️  Pipeline Parallelism requested but using single GPU (need more GPUs)"}
+            yield {"type": "info", "message": "⚠️  Pipeline Parallelism requested but using single GPU (need more GPUs or distributed setup)"}
     
     if use_recompute_ui: 
         yield {"type": "info", "message": "✅ Gradient Checkpointing ENABLED - Memory usage will be reduced during training!"}
@@ -305,13 +359,29 @@ def run_nanoGPT_training(
             with ctx:
                 # Use advanced forward pass with all parallelism types
                 if hasattr(model, 'pipeline_forward') and (use_pipeline_parallel_ui and pipeline_parallel_size > 1):
-                    logits, loss_from_model = model.pipeline_forward(X, Y, use_recompute=use_recompute_ui, 
-                                                                   micro_batch_size=micro_batch_size_ui)
+                    result = model.pipeline_forward(X, Y, use_recompute=use_recompute_ui, 
+                                                   micro_batch_size=micro_batch_size_ui)
                 else:
-                    logits, loss_from_model = model(X, Y, use_recompute=use_recompute_ui)
+                    result = model(X, Y, use_recompute=use_recompute_ui)
+                
+                # Handle the case where model returns None or invalid result
+                if result is None or (isinstance(result, tuple) and len(result) < 2):
+                    yield {"type": "error", "message": "Model returned None or invalid result. Check parallelism configuration."}
+                    return
+                
+                if isinstance(result, tuple):
+                    logits, loss_from_model = result
+                else:
+                    # If model only returns loss (some configurations)
+                    logits, loss_from_model = None, result
+            
+            # Ensure loss_from_model is valid and convert to scalar
+            if loss_from_model is None:
+                yield {"type": "error", "message": "Model returned None loss. Check model configuration and parallelism settings."}
+                return
             
             # Ensure loss_from_model is a scalar by averaging if it came from DataParallel.
-            actual_loss_this_micro_batch = loss_from_model.mean()
+            actual_loss_this_micro_batch = loss_from_model.mean() if hasattr(loss_from_model, 'mean') else loss_from_model
             
             # Scale loss for gradient accumulation
             loss_for_backward_and_accumulation = actual_loss_this_micro_batch / grad_accumulation_steps_ui
