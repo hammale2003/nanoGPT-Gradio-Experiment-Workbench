@@ -71,8 +71,16 @@ class TensorParallelLinear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
     
     def forward(self, input):
-        # Only use distributed communication if properly initialized
+        # Only use distributed communication if properly initialized AND we have multiple ranks
+        use_distributed = False
         if self.tensor_parallel_size > 1 and is_dist_available_and_initialized():
+            try:
+                if dist.get_world_size() > 1:
+                    use_distributed = True
+            except:
+                pass  # Fallback to single-process mode
+        
+        if use_distributed:
             # All-gather input across tensor parallel ranks
             outputs = [torch.empty_like(input) for _ in range(self.tensor_parallel_size)]
             try:
@@ -86,8 +94,7 @@ class TensorParallelLinear(nn.Module):
         # Compute local portion of the linear transformation
         output = F.linear(input, self.weight, self.bias)
         
-        # Only use distributed communication if properly initialized
-        if self.tensor_parallel_size > 1 and is_dist_available_and_initialized():
+        if use_distributed:
             try:
                 dist.all_reduce(output)
             except Exception as e:
@@ -270,7 +277,18 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         
         # Choose attention and MLP based on tensor parallelism settings
+        # Only use tensor parallel components if distributed is properly initialized
+        use_tensor_parallel = False
         if tensor_parallel_size > 1:
+            try:
+                if is_dist_available_and_initialized() and dist.get_world_size() > 1:
+                    use_tensor_parallel = True
+                else:
+                    print(f"⚠️  Block: tensor_parallel_size={tensor_parallel_size} but distributed not properly initialized, using standard components")
+            except:
+                print(f"⚠️  Block: tensor_parallel_size={tensor_parallel_size} but distributed check failed, using standard components")
+        
+        if use_tensor_parallel:
             self.attn = TensorParallelCausalSelfAttention(config, tensor_parallel_size, tensor_parallel_rank)
             self.mlp = TensorParallelMLP(config, tensor_parallel_size, tensor_parallel_rank)
         else:
