@@ -267,9 +267,19 @@ def run_nanoGPT_training(
     # Configure parallelism - allow pipeline parallelism even without distributed
     pipeline_parallel_size = min(num_gpus, 2) if use_pipeline_parallel_ui and num_gpus > 1 else 1
     
-    # Tensor parallelism configuration
-    if dist_available:
-        tensor_parallel_size = min(num_gpus, 2) if use_tensor_parallel_ui and num_gpus > 1 else 1
+    # Tensor parallelism configuration - only enable if distributed is truly available
+    if dist_available and use_tensor_parallel_ui and num_gpus > 1:
+        try:
+            # Double-check that distributed is working properly
+            if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                tensor_parallel_size = min(num_gpus, 2)
+                print("✅ Tensor Parallelism enabled with distributed training")
+            else:
+                tensor_parallel_size = 1
+                print("⚠️  Tensor Parallelism disabled: distributed not properly initialized")
+        except Exception as e:
+            tensor_parallel_size = 1
+            print(f"⚠️  Tensor Parallelism disabled due to distributed error: {e}")
     else:
         tensor_parallel_size = 1
         if use_tensor_parallel_ui and num_gpus > 1:
@@ -399,13 +409,19 @@ def run_nanoGPT_training(
         if tensor_parallel_size > 1 and dist_available:
             yield {"type": "info", "message": f"✅ Tensor Parallelism ENABLED - Using {tensor_parallel_size} GPUs for tensor operations"}
             yield {"type": "info", "message": f"🔗 PyTorch distributed initialized for multi-GPU communication"}
-        elif use_tensor_parallel_ui and num_gpus > 1 and not dist_available:
-            yield {"type": "info", "message": "⚠️  Tensor Parallelism requested but PyTorch distributed initialization failed"}
-            yield {"type": "info", "message": "   Using standard training instead (consider checking NCCL/CUDA setup)"}
-        elif use_tensor_parallel_ui and num_gpus <= 1:
-            yield {"type": "info", "message": "⚠️  Tensor Parallelism requested but only 1 GPU available"}
         else:
-            yield {"type": "info", "message": "⚠️  Tensor Parallelism setup issue - using standard training"}
+            # Tensor parallelism was requested but couldn't be enabled
+            reason = "unknown reason"
+            if num_gpus <= 1:
+                reason = "only 1 GPU available"
+            elif not dist_available:
+                reason = "PyTorch distributed initialization failed"
+            elif tensor_parallel_size <= 1:
+                reason = "distributed not properly initialized"
+            
+            yield {"type": "info", "message": f"⚠️  Tensor Parallelism requested but disabled due to: {reason}"}
+            yield {"type": "info", "message": "   Using standard training instead. Model will use regular (non-tensor-parallel) components."}
+            yield {"type": "info", "message": "   💡 For tensor parallelism: ensure multiple GPUs and proper NCCL/CUDA setup"}
     
     if use_pipeline_parallel_ui: 
         if pipeline_parallel_size > 1:
