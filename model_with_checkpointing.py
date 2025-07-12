@@ -354,8 +354,9 @@ class GPTWithSingleProcessPipeline(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         
-        # Weight tying
-        self.transformer_embeddings.wte.weight = self.lm_head.weight
+        # NOTE: Do NOT tie weights here in pipeline parallelism context
+        # Weight tying will be handled carefully in the forward pass
+        # self.transformer_embeddings.wte.weight = self.lm_head.weight  # REMOVED
         
         # Initialize weights
         self.apply(self._init_weights)
@@ -370,6 +371,9 @@ class GPTWithSingleProcessPipeline(nn.Module):
         
         # Move pipeline stages to different GPUs
         self._setup_pipeline_devices()
+        
+        # Handle weight tying after device placement
+        self._setup_weight_tying()
     
     def _setup_pipeline_devices(self):
         """Place different pipeline stages on different GPUs."""
@@ -415,6 +419,26 @@ class GPTWithSingleProcessPipeline(nn.Module):
             print(f"❌ Warning: Failed to setup pipeline devices: {e}")
             print("Falling back to placing entire model on GPU 0")
             self.to('cuda:0')
+    
+    def _setup_weight_tying(self):
+        """Handle weight tying in pipeline parallelism context."""
+        # For pipeline parallelism, we avoid weight tying to prevent device mismatch issues
+        # This is a common approach in distributed training where components are on different devices
+        
+        # Check if embeddings and lm_head are on the same device
+        emb_device = next(self.transformer_embeddings.parameters()).device
+        lm_head_device = self.lm_head.weight.device
+        
+        if emb_device == lm_head_device:
+            # Same device - we can safely tie weights
+            print(f"✅ Weight tying enabled (both on {emb_device})")
+            self.transformer_embeddings.wte.weight = self.lm_head.weight
+            self.weights_tied = True
+        else:
+            # Different devices - avoid weight tying to prevent device mismatch
+            print(f"⚠️  Weight tying disabled due to different devices: emb={emb_device}, lm_head={lm_head_device}")
+            print("   This is normal and safe for pipeline parallelism")
+            self.weights_tied = False
     
     def _verify_device_placement(self):
         """Verify that the model is properly distributed across GPUs."""
@@ -469,27 +493,32 @@ class GPTWithSingleProcessPipeline(nn.Module):
             # Determine the embeddings device (first pipeline stage)
             embeddings_device = next(self.transformer_embeddings.parameters()).device
             
-            # Move input and position tensors to embeddings device
+            # Move input to embeddings device and ensure position tensor is on same device
             idx = idx.to(embeddings_device)
             pos = torch.arange(0, t, dtype=torch.long, device=embeddings_device)
             
-            tok_emb = self.transformer_embeddings.wte(idx)
-            pos_emb = self.transformer_embeddings.wpe(pos)
-            x = self.transformer_embeddings.drop(tok_emb + pos_emb)
+            # Ensure embedding lookups happen on the correct device
+            # All parameters and inputs must be on the same device for embedding operations
+            with torch.cuda.device(embeddings_device):
+                tok_emb = self.transformer_embeddings.wte(idx)
+                pos_emb = self.transformer_embeddings.wpe(pos)
+                x = self.transformer_embeddings.drop(tok_emb + pos_emb)
             
-            # Apply pipeline stages with proper device management
+            # Apply pipeline stages with careful device management
             for stage_id, stage in enumerate(self.pipeline_stages):
-                # Move to the device where this stage is located
                 if len(list(stage.parameters())) > 0:  # Check if stage has parameters
                     stage_device = next(stage.parameters()).device
+                    
+                    # Move data to stage device and set device context
                     x = x.to(stage_device)
                     
-                    # Apply all blocks in this stage
-                    for block in stage:
-                        if use_recompute and self.training:
-                            x = checkpoint(block, x, use_reentrant=False)
-                        else:
-                            x = block(x)
+                    with torch.cuda.device(stage_device):
+                        # Apply all blocks in this stage
+                        for block in stage:
+                            if use_recompute and self.training:
+                                x = checkpoint(block, x, use_reentrant=False)
+                            else:
+                                x = block(x)
                 else:
                     # Handle empty stages gracefully
                     continue
@@ -497,36 +526,45 @@ class GPTWithSingleProcessPipeline(nn.Module):
             # Final stage: layer norm and language model head
             final_device = next(self.transformer_final.parameters()).device
             x = x.to(final_device)
-            x = self.transformer_final.ln_f(x)
             
-            if targets is not None:
-                targets = targets.to(final_device)
-                logits = self.lm_head(x)
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-                return logits, loss
-            else:
-                # Inference optimization: only compute logits for the last position
-                logits = self.lm_head(x[:, [-1], :])
-                return logits, None
+            # Ensure final operations happen on the correct device
+            with torch.cuda.device(final_device):
+                x = self.transformer_final.ln_f(x)
+                
+                if targets is not None:
+                    targets = targets.to(final_device)
+                    logits = self.lm_head(x)
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                    return logits, loss
+                else:
+                    # Inference optimization: only compute logits for the last position
+                    logits = self.lm_head(x[:, [-1], :])
+                    return logits, None
                 
         except RuntimeError as e:
             if "Expected all tensors to be on the same device" in str(e):
                 print(f"❌ Device mismatch error in pipeline forward: {e}")
-                print("🔄 Attempting to place entire model on single device...")
+                print("🔄 Attempting single-device fallback...")
                 
-                # Fallback: move everything to the same device
-                device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-                self.to(device)
-                idx = idx.to(device)
+                # Fallback: move everything to a single device
+                fallback_device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+                
+                # Move all model components to the same device
+                print(f"   Moving entire model to {fallback_device}")
+                self.to(fallback_device)
+                
+                # Move input tensors to the same device
+                idx = idx.to(fallback_device)
                 if targets is not None:
-                    targets = targets.to(device)
-                pos = torch.arange(0, t, dtype=torch.long, device=device)
+                    targets = targets.to(fallback_device)
+                pos = torch.arange(0, t, dtype=torch.long, device=fallback_device)
                 
-                # Simple forward pass without pipeline
+                # Simple forward pass without pipeline parallelism
                 tok_emb = self.transformer_embeddings.wte(idx)
                 pos_emb = self.transformer_embeddings.wpe(pos)
                 x = self.transformer_embeddings.drop(tok_emb + pos_emb)
                 
+                # Apply all transformer blocks sequentially
                 for stage in self.pipeline_stages:
                     for block in stage:
                         if use_recompute and self.training:
@@ -534,6 +572,7 @@ class GPTWithSingleProcessPipeline(nn.Module):
                         else:
                             x = block(x)
                 
+                # Final layer norm and language model head
                 x = self.transformer_final.ln_f(x)
                 
                 if targets is not None:
@@ -822,6 +861,3 @@ GPT = GPTWithAdvancedParallelism
 # Compatibility classes
 GPTWithCheckpointing = GPTWithAdvancedParallelism
 GPT = GPTWithAdvancedParallelism 
-
-
-
