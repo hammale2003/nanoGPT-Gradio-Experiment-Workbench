@@ -382,33 +382,39 @@ def run_nanoGPT_training(
     # Initialize model with parallelism configuration
     try:
         # Choose the appropriate model based on parallelism configuration
-        if pipeline_parallel_size > 1 and not dist_available and GPTWithSingleProcessPipeline is not None:
-            # Use single-process pipeline parallelism
+        if pipeline_parallel_size > 1 and GPTWithSingleProcessPipeline is not None:
+            # Use single-process pipeline parallelism for any pipeline parallelism
             print("🔄 Using GPTWithSingleProcessPipeline for pipeline parallelism")
             tensor_parallel_rank = 0
             model = GPTWithSingleProcessPipeline(gptconf, tensor_parallel_rank=tensor_parallel_rank)
-        elif (tensor_parallel_size > 1 or pipeline_parallel_size > 1) and dist_available:
-            # Use advanced model with distributed parallelism
-            print("🔄 Using GPTWithAdvancedParallelism for distributed tensor/pipeline parallelism")
-            pipeline_rank = 0  # For now, we'll use rank 0 (single-process training)
+        elif tensor_parallel_size > 1 and dist_available:
+            # Use advanced model ONLY for tensor parallelism (not pipeline)
+            print("🔄 Using GPTWithAdvancedParallelism for tensor parallelism")
+            # For tensor parallelism without pipeline parallelism, set pipeline_parallel_size = 1
+            # and create a single-stage model that contains everything
+            single_stage_config = GPTConfig(
+                n_layer=gptconf.n_layer, n_head=gptconf.n_head, n_embd=gptconf.n_embd,
+                block_size=gptconf.block_size, bias=gptconf.bias, vocab_size=gptconf.vocab_size,
+                dropout=gptconf.dropout, pipeline_parallel_size=1, tensor_parallel_size=tensor_parallel_size
+            )
+            pipeline_rank = 0  # Single stage containing everything
             tensor_parallel_rank = 0
             from model_with_checkpointing import GPTWithAdvancedParallelism
-            model = GPTWithAdvancedParallelism(gptconf, pipeline_rank=pipeline_rank, tensor_parallel_rank=tensor_parallel_rank)
+            model = GPTWithAdvancedParallelism(single_stage_config, pipeline_rank=pipeline_rank, tensor_parallel_rank=tensor_parallel_rank)
         else:
             # Use standard model for single-GPU or when advanced features are not available
             print("🔄 Using standard GPT model")
-            pipeline_rank = 0
-            tensor_parallel_rank = 0
-            model = GPT(gptconf, pipeline_rank=pipeline_rank, tensor_parallel_rank=tensor_parallel_rank)
-    except TypeError as e:
+            model = GPT(gptconf)
+    except Exception as e:
         print(f"⚠️  Model initialization error: {e}")
         # Fallback to original model if advanced features not available
         try:
+            # Try the advanced GPT model without extra parameters
             model = GPT(gptconf)
-            print("✅ Using standard model initialization (no parallelism features)")
+            print("✅ Using standard GPT model (fallback)")
         except Exception as e2:
             # Last resort: try importing the original nanoGPT model
-            print(f"❌ Standard model failed too: {e2}")
+            print(f"❌ Standard GPT model failed too: {e2}")
             try:
                 from nanoGPT.model import GPT as OriginalGPT
                 model = OriginalGPT(gptconf)
