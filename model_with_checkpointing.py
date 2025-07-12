@@ -37,81 +37,7 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-class TensorParallelLinear(nn.Module):
-    """
-    Linear layer with tensor parallelism support.
-    Splits the weight matrix across multiple GPUs.
-    """
-    
-    def __init__(self, in_features, out_features, bias=True, tensor_parallel_size=1, tensor_parallel_rank=0):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.tensor_parallel_size = tensor_parallel_size
-        self.tensor_parallel_rank = tensor_parallel_rank
-        
-        # Split output features across tensor parallel ranks
-        assert out_features % tensor_parallel_size == 0, f"out_features ({out_features}) must be divisible by tensor_parallel_size ({tensor_parallel_size})"
-        self.out_features_per_rank = out_features // tensor_parallel_size
-        
-        # Create weight matrix for this rank's portion
-        self.weight = nn.Parameter(torch.empty(self.out_features_per_rank, in_features))
-        if bias:
-            self.bias = nn.Parameter(torch.empty(self.out_features_per_rank))
-        else:
-            self.register_parameter('bias', None)
-        
-        self.reset_parameters()
-    
-    def reset_parameters(self):
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / math.sqrt(fan_in)
-            nn.init.uniform_(self.bias, -bound, bound)
-    
-    def forward(self, input):
-        # Check if we should use distributed communication
-        use_distributed = False
-        if self.tensor_parallel_size > 1 and is_dist_available_and_initialized():
-            try:
-                # Allow tensor parallelism even in single-process mode (world_size == 1)
-                # This enables simulated tensor parallelism across GPUs
-                use_distributed = True
-            except:
-                pass  # Fallback to single-process mode
-        
-        if use_distributed:
-            # In single-process mode (world_size == 1), skip all-gather since there's only one rank
-            try:
-                world_size = dist.get_world_size()
-                if world_size > 1:
-                    # Multi-process: All-gather input across tensor parallel ranks
-                    outputs = [torch.empty_like(input) for _ in range(self.tensor_parallel_size)]
-                    dist.all_gather(outputs, input)
-                    input = torch.cat(outputs, dim=-1)
-                # Single-process: input stays as-is
-            except Exception as e:
-                # Fallback to single-process mode if distributed fails
-                print(f"Warning: Distributed communication failed, falling back to single-process mode: {e}")
-                pass
-        
-        # Compute local portion of the linear transformation
-        output = F.linear(input, self.weight, self.bias)
-        
-        if use_distributed:
-            try:
-                world_size = dist.get_world_size()
-                if world_size > 1:
-                    # Multi-process: All-reduce across ranks
-                    dist.all_reduce(output)
-                # Single-process: no reduction needed
-            except Exception as e:
-                # Fallback to single-process mode if distributed fails
-                print(f"Warning: Distributed all-reduce failed, falling back to single-process mode: {e}")
-                pass
-        
-        return output
+# TensorParallelLinear class removed - using regular nn.Linear with manual all-reduce is cleaner
 
 class TensorParallelCausalSelfAttention(nn.Module):
     """
@@ -130,12 +56,10 @@ class TensorParallelCausalSelfAttention(nn.Module):
         self.n_head_per_rank = config.n_head // tensor_parallel_size
         self.n_embd_per_rank = config.n_embd // tensor_parallel_size
         
-        # QKV projection for this rank's heads
-        self.c_attn = TensorParallelLinear(config.n_embd, 3 * self.n_embd_per_rank, bias=config.bias, 
-                                          tensor_parallel_size=tensor_parallel_size, tensor_parallel_rank=tensor_parallel_rank)
-        # Output projection
-        self.c_proj = TensorParallelLinear(self.n_embd_per_rank, config.n_embd, bias=config.bias,
-                                          tensor_parallel_size=tensor_parallel_size, tensor_parallel_rank=tensor_parallel_rank)
+        # QKV projection for this rank's heads - use regular Linear since each rank computes its own QKV
+        self.c_attn = nn.Linear(config.n_embd, 3 * self.n_embd_per_rank, bias=config.bias)
+        # Output projection - use regular Linear and handle all-reduce manually
+        self.c_proj = nn.Linear(self.n_embd_per_rank, config.n_embd, bias=config.bias)
         
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -156,9 +80,14 @@ class TensorParallelCausalSelfAttention(nn.Module):
 
         # QKV computation for local heads
         q, k, v = self.c_attn(x).split(self.n_embd_per_rank, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh_local, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh_local, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh_local, T, hs)
+        
+        # Calculate head size for this rank
+        head_size = self.n_embd_per_rank // self.n_head_per_rank
+        
+        # Reshape for attention computation
+        k = k.view(B, T, self.n_head_per_rank, head_size).transpose(1, 2)  # (B, nh_local, T, hs)
+        q = q.view(B, T, self.n_head_per_rank, head_size).transpose(1, 2)  # (B, nh_local, T, hs)
+        v = v.view(B, T, self.n_head_per_rank, head_size).transpose(1, 2)  # (B, nh_local, T, hs)
 
         # Attention computation
         if self.flash:
@@ -172,8 +101,23 @@ class TensorParallelCausalSelfAttention(nn.Module):
 
         y = y.transpose(1, 2).contiguous().view(B, T, self.n_embd_per_rank)
         
-        # Output projection with tensor parallelism
-        y = self.resid_dropout(self.c_proj(y))
+        # Output projection
+        y = self.c_proj(y)
+        
+        # All-reduce across tensor parallel ranks
+        if self.tensor_parallel_size > 1 and is_dist_available_and_initialized():
+            try:
+                world_size = dist.get_world_size()
+                if world_size > 1:
+                    # Multi-process: All-reduce across ranks
+                    dist.all_reduce(y)
+                # Single-process: no reduction needed since we're simulating
+            except Exception as e:
+                # Fallback to single-process mode if distributed fails
+                print(f"Warning: Distributed all-reduce failed in attention, falling back to single-process mode: {e}")
+                pass
+        
+        y = self.resid_dropout(y)
         return y
 
 class CausalSelfAttention(nn.Module):
@@ -225,37 +169,37 @@ class TensorParallelMLP(nn.Module):
         self.tensor_parallel_size = tensor_parallel_size
         self.tensor_parallel_rank = tensor_parallel_rank
         
-        # First linear layer: split the 4*n_embd dimension
-        self.c_fc = TensorParallelLinear(config.n_embd, 4 * config.n_embd, bias=config.bias,
-                                        tensor_parallel_size=tensor_parallel_size, tensor_parallel_rank=tensor_parallel_rank)
+        # For tensor parallelism in MLP, we split the intermediate dimension
+        self.intermediate_size = (4 * config.n_embd) // tensor_parallel_size
+        
+        # First linear layer: each rank handles part of the intermediate dimension
+        self.c_fc = nn.Linear(config.n_embd, self.intermediate_size, bias=config.bias)
         self.gelu = nn.GELU()
         
-        # Second linear layer: input is split, output is gathered
-        intermediate_size = (4 * config.n_embd) // tensor_parallel_size
-        self.c_proj = nn.Linear(intermediate_size, config.n_embd, bias=config.bias)
+        # Second linear layer: input is split, output needs to be all-reduced
+        self.c_proj = nn.Linear(self.intermediate_size, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)  # This handles the tensor parallel split and gather
+        # First linear layer: each rank computes its portion of the intermediate dimension
+        x = self.c_fc(x)
         x = self.gelu(x)
         
-        # For the second linear layer, we need to split the input and all-reduce the output
+        # Second linear layer: each rank computes its portion and we all-reduce the result
+        x = self.c_proj(x)
+        
+        # All-reduce across tensor parallel ranks
         if self.tensor_parallel_size > 1 and is_dist_available_and_initialized():
-            # Split input for local computation
-            chunk_size = x.size(-1) // self.tensor_parallel_size
-            x_local = x[..., self.tensor_parallel_rank * chunk_size:(self.tensor_parallel_rank + 1) * chunk_size]
-            x_local = self.c_proj(x_local)
-            
-            # All-reduce the outputs
             try:
-                dist.all_reduce(x_local, op=dist.ReduceOp.SUM)
-                x = x_local
+                world_size = dist.get_world_size()
+                if world_size > 1:
+                    # Multi-process: All-reduce across ranks
+                    dist.all_reduce(x)
+                # Single-process: no reduction needed since we're simulating
             except Exception as e:
                 # Fallback to single-process mode if distributed fails
                 print(f"Warning: Distributed all-reduce failed in MLP, falling back to single-process mode: {e}")
-                x = self.c_proj(x)
-        else:
-            x = self.c_proj(x)
+                pass
         
         x = self.dropout(x)
         return x
