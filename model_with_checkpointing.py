@@ -312,6 +312,173 @@ class GPTConfig:
     pipeline_parallel_size: int = 1
     tensor_parallel_size: int = 1
 
+class GPTWithSingleProcessPipeline(nn.Module):
+    """
+    GPT model with single-process pipeline parallelism.
+    All pipeline stages in one model, placed on different GPUs.
+    """
+    
+    def __init__(self, config, tensor_parallel_rank=0):
+        super().__init__()
+        assert config.vocab_size is not None
+        assert config.block_size is not None
+        self.config = config
+        self.tensor_parallel_rank = tensor_parallel_rank
+        
+        # Create embeddings (always on GPU 0)
+        self.transformer_embeddings = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
+            drop = nn.Dropout(config.dropout),
+        ))
+        
+        # Create all transformer blocks and assign them to pipeline stages
+        self.pipeline_stages = nn.ModuleList()
+        layers_per_stage = config.n_layer // config.pipeline_parallel_size
+        
+        for stage_id in range(config.pipeline_parallel_size):
+            start_layer = stage_id * layers_per_stage
+            end_layer = min((stage_id + 1) * layers_per_stage, config.n_layer)
+            
+            stage_blocks = []
+            for layer_idx in range(start_layer, end_layer):
+                block = Block(config, config.tensor_parallel_size, tensor_parallel_rank)
+                stage_blocks.append(block)
+            
+            stage = nn.ModuleList(stage_blocks)
+            self.pipeline_stages.append(stage)
+        
+        # Final layer norm and language model head (always on last GPU)
+        self.transformer_final = nn.ModuleDict(dict(
+            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        
+        # Weight tying
+        self.transformer_embeddings.wte.weight = self.lm_head.weight
+        
+        # Initialize weights
+        self.apply(self._init_weights)
+        
+        # Special scaled init for residual projections
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+        
+        print(f"Single-process pipeline with {config.pipeline_parallel_size} stages")
+        print(f"Total parameters: {self.get_num_params()/1e6:.2f}M")
+        
+        # Move pipeline stages to different GPUs
+        self._setup_pipeline_devices()
+    
+    def _setup_pipeline_devices(self):
+        """Place different pipeline stages on different GPUs."""
+        if not torch.cuda.is_available():
+            return
+            
+        num_gpus = torch.cuda.device_count()
+        if num_gpus < 2:
+            return
+            
+        # Place embeddings on GPU 0
+        self.transformer_embeddings.to(f'cuda:0')
+        
+        # Distribute pipeline stages across GPUs
+        for stage_id, stage in enumerate(self.pipeline_stages):
+            gpu_id = stage_id % num_gpus
+            stage.to(f'cuda:{gpu_id}')
+            print(f"Pipeline stage {stage_id} placed on GPU {gpu_id}")
+        
+        # Place final layers on the last GPU used
+        final_gpu = (len(self.pipeline_stages) - 1) % num_gpus
+        self.transformer_final.to(f'cuda:{final_gpu}')
+        self.lm_head.to(f'cuda:{final_gpu}')
+        print(f"Final layers placed on GPU {final_gpu}")
+    
+    def get_num_params(self, non_embedding=True):
+        """Return the number of parameters in the model."""
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.transformer_embeddings.wpe.weight.numel()
+        return n_params
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
+    def forward(self, idx, targets=None, use_recompute=False):
+        """Forward pass with single-process pipeline parallelism."""
+        device = idx.device
+        b, t = idx.size()
+        
+        # Stage 0: Embeddings (GPU 0)
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        
+        # Move to GPU 0 for embeddings
+        idx = idx.to('cuda:0')
+        pos = pos.to('cuda:0')
+        
+        tok_emb = self.transformer_embeddings.wte(idx)
+        pos_emb = self.transformer_embeddings.wpe(pos)
+        x = self.transformer_embeddings.drop(tok_emb + pos_emb)
+        
+        # Apply pipeline stages
+        num_gpus = torch.cuda.device_count()
+        for stage_id, stage in enumerate(self.pipeline_stages):
+            gpu_id = stage_id % num_gpus
+            x = x.to(f'cuda:{gpu_id}')
+            
+            for block in stage:
+                if use_recompute and self.training:
+                    x = checkpoint(block, x, use_reentrant=False)
+                else:
+                    x = block(x)
+        
+        # Final stage: layer norm and language model head
+        final_gpu = (len(self.pipeline_stages) - 1) % num_gpus
+        x = x.to(f'cuda:{final_gpu}')
+        x = self.transformer_final.ln_f(x)
+        
+        if targets is not None:
+            targets = targets.to(f'cuda:{final_gpu}')
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            return logits, loss
+        else:
+            # Inference optimization: only compute logits for the last position
+            logits = self.lm_head(x[:, [-1], :])
+            return logits, None
+    
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        """Configure optimizers with support for parallelism."""
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
+        
+        return optimizer
+
 class GPTWithAdvancedParallelism(nn.Module):
     """
     GPT model with REAL implementations of:
@@ -534,6 +701,9 @@ class GPTWithAdvancedParallelism(nn.Module):
                 idx = torch.cat((idx, idx_next), dim=1)
         
         return idx
+
+# Main GPT class alias - choose the appropriate implementation based on configuration
+GPT = GPTWithAdvancedParallelism
 
 # Compatibility classes
 GPTWithCheckpointing = GPTWithAdvancedParallelism
