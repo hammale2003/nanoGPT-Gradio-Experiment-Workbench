@@ -383,27 +383,65 @@ class GPTWithSingleProcessPipeline(nn.Module):
             self.to('cuda:0')
             return
             
+        # Clear all GPU memory first
+        for i in range(num_gpus):
+            torch.cuda.empty_cache()
+            
         try:
+            # Use exactly the number of GPUs specified in pipeline_parallel_size
+            actual_gpus_to_use = min(num_gpus, self.config.pipeline_parallel_size)
+            
             # Place embeddings on GPU 0
             self.transformer_embeddings.to('cuda:0')
-            print(f"Embeddings placed on GPU 0")
+            print(f"✅ Embeddings placed on GPU 0")
             
             # Distribute pipeline stages across GPUs
             for stage_id, stage in enumerate(self.pipeline_stages):
-                gpu_id = stage_id % num_gpus
+                gpu_id = stage_id % actual_gpus_to_use
                 stage.to(f'cuda:{gpu_id}')
-                print(f"Pipeline stage {stage_id} placed on GPU {gpu_id}")
+                print(f"✅ Pipeline stage {stage_id} (layers {stage_id * (self.config.n_layer // self.config.pipeline_parallel_size)}-{min((stage_id + 1) * (self.config.n_layer // self.config.pipeline_parallel_size), self.config.n_layer)}) placed on GPU {gpu_id}")
             
             # Place final layers on the last GPU used
-            final_gpu = (len(self.pipeline_stages) - 1) % num_gpus
+            final_gpu = (len(self.pipeline_stages) - 1) % actual_gpus_to_use
             self.transformer_final.to(f'cuda:{final_gpu}')
             self.lm_head.to(f'cuda:{final_gpu}')
-            print(f"Final layers placed on GPU {final_gpu}")
+            print(f"✅ Final layers placed on GPU {final_gpu}")
+            
+            # Verify placement
+            print(f"✅ Pipeline parallelism setup complete - using {actual_gpus_to_use} GPUs")
+            self._verify_device_placement()
             
         except Exception as e:
-            print(f"Warning: Failed to setup pipeline devices: {e}")
+            print(f"❌ Warning: Failed to setup pipeline devices: {e}")
             print("Falling back to placing entire model on GPU 0")
             self.to('cuda:0')
+    
+    def _verify_device_placement(self):
+        """Verify that the model is properly distributed across GPUs."""
+        device_usage = {}
+        
+        # Check embeddings
+        emb_device = next(self.transformer_embeddings.parameters()).device
+        device_usage[str(emb_device)] = device_usage.get(str(emb_device), 0) + 1
+        
+        # Check pipeline stages
+        for stage_id, stage in enumerate(self.pipeline_stages):
+            if len(list(stage.parameters())) > 0:
+                stage_device = next(stage.parameters()).device
+                device_usage[str(stage_device)] = device_usage.get(str(stage_device), 0) + 1
+        
+        # Check final layers
+        final_device = next(self.transformer_final.parameters()).device
+        device_usage[str(final_device)] = device_usage.get(str(final_device), 0) + 1
+        
+        print(f"Device usage summary: {device_usage}")
+        
+        if len(device_usage) > 1:
+            print("✅ Model successfully distributed across multiple GPUs!")
+        else:
+            print("⚠️  Model is on a single device only")
+            
+        return len(device_usage) > 1
     
     def get_num_params(self, non_embedding=True):
         """Return the number of parameters in the model."""
@@ -439,18 +477,22 @@ class GPTWithSingleProcessPipeline(nn.Module):
             pos_emb = self.transformer_embeddings.wpe(pos)
             x = self.transformer_embeddings.drop(tok_emb + pos_emb)
             
-            # Apply pipeline stages
+            # Apply pipeline stages with proper device management
             for stage_id, stage in enumerate(self.pipeline_stages):
                 # Move to the device where this stage is located
                 if len(list(stage.parameters())) > 0:  # Check if stage has parameters
                     stage_device = next(stage.parameters()).device
                     x = x.to(stage_device)
-                
-                for block in stage:
-                    if use_recompute and self.training:
-                        x = checkpoint(block, x, use_reentrant=False)
-                    else:
-                        x = block(x)
+                    
+                    # Apply all blocks in this stage
+                    for block in stage:
+                        if use_recompute and self.training:
+                            x = checkpoint(block, x, use_reentrant=False)
+                        else:
+                            x = block(x)
+                else:
+                    # Handle empty stages gracefully
+                    continue
             
             # Final stage: layer norm and language model head
             final_device = next(self.transformer_final.parameters()).device
@@ -469,8 +511,9 @@ class GPTWithSingleProcessPipeline(nn.Module):
                 
         except RuntimeError as e:
             if "Expected all tensors to be on the same device" in str(e):
-                print(f"Device mismatch error in pipeline forward: {e}")
-                print("Attempting to place entire model on single device...")
+                print(f"❌ Device mismatch error in pipeline forward: {e}")
+                print("🔄 Attempting to place entire model on single device...")
+                
                 # Fallback: move everything to the same device
                 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
                 self.to(device)
@@ -501,8 +544,30 @@ class GPTWithSingleProcessPipeline(nn.Module):
                     logits = self.lm_head(x[:, [-1], :])
                     return logits, None
             else:
+                print(f"❌ Unexpected error in pipeline forward: {e}")
                 raise  # Re-raise if it's a different error
     
+    def get_pipeline_device_info(self):
+        """Get information about which devices are being used by the pipeline."""
+        device_info = {}
+        
+        # Embeddings device
+        if hasattr(self.transformer_embeddings, 'wte'):
+            device_info['embeddings'] = str(next(self.transformer_embeddings.parameters()).device)
+        
+        # Pipeline stages devices
+        device_info['stages'] = []
+        for stage_id, stage in enumerate(self.pipeline_stages):
+            if len(list(stage.parameters())) > 0:
+                stage_device = str(next(stage.parameters()).device)
+                device_info['stages'].append(f"Stage {stage_id}: {stage_device}")
+        
+        # Final layers device
+        if hasattr(self.transformer_final, 'ln_f'):
+            device_info['final'] = str(next(self.transformer_final.parameters()).device)
+        
+        return device_info
+
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         """Configure optimizers with support for parallelism."""
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -757,3 +822,6 @@ GPT = GPTWithAdvancedParallelism
 # Compatibility classes
 GPTWithCheckpointing = GPTWithAdvancedParallelism
 GPT = GPTWithAdvancedParallelism 
+
+
+
