@@ -374,26 +374,36 @@ class GPTWithSingleProcessPipeline(nn.Module):
     def _setup_pipeline_devices(self):
         """Place different pipeline stages on different GPUs."""
         if not torch.cuda.is_available():
+            print("CUDA not available, keeping model on CPU")
             return
             
         num_gpus = torch.cuda.device_count()
         if num_gpus < 2:
+            print(f"Only {num_gpus} GPU(s) available, placing entire model on GPU 0")
+            self.to('cuda:0')
             return
             
-        # Place embeddings on GPU 0
-        self.transformer_embeddings.to(f'cuda:0')
-        
-        # Distribute pipeline stages across GPUs
-        for stage_id, stage in enumerate(self.pipeline_stages):
-            gpu_id = stage_id % num_gpus
-            stage.to(f'cuda:{gpu_id}')
-            print(f"Pipeline stage {stage_id} placed on GPU {gpu_id}")
-        
-        # Place final layers on the last GPU used
-        final_gpu = (len(self.pipeline_stages) - 1) % num_gpus
-        self.transformer_final.to(f'cuda:{final_gpu}')
-        self.lm_head.to(f'cuda:{final_gpu}')
-        print(f"Final layers placed on GPU {final_gpu}")
+        try:
+            # Place embeddings on GPU 0
+            self.transformer_embeddings.to('cuda:0')
+            print(f"Embeddings placed on GPU 0")
+            
+            # Distribute pipeline stages across GPUs
+            for stage_id, stage in enumerate(self.pipeline_stages):
+                gpu_id = stage_id % num_gpus
+                stage.to(f'cuda:{gpu_id}')
+                print(f"Pipeline stage {stage_id} placed on GPU {gpu_id}")
+            
+            # Place final layers on the last GPU used
+            final_gpu = (len(self.pipeline_stages) - 1) % num_gpus
+            self.transformer_final.to(f'cuda:{final_gpu}')
+            self.lm_head.to(f'cuda:{final_gpu}')
+            print(f"Final layers placed on GPU {final_gpu}")
+            
+        except Exception as e:
+            print(f"Warning: Failed to setup pipeline devices: {e}")
+            print("Falling back to placing entire model on GPU 0")
+            self.to('cuda:0')
     
     def get_num_params(self, non_embedding=True):
         """Return the number of parameters in the model."""
@@ -412,47 +422,86 @@ class GPTWithSingleProcessPipeline(nn.Module):
     
     def forward(self, idx, targets=None, use_recompute=False):
         """Forward pass with single-process pipeline parallelism."""
-        device = idx.device
         b, t = idx.size()
         
-        # Stage 0: Embeddings (GPU 0)
+        # Stage 0: Embeddings (first pipeline stage)
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
         
-        # Move to GPU 0 for embeddings
-        idx = idx.to('cuda:0')
-        pos = pos.to('cuda:0')
-        
-        tok_emb = self.transformer_embeddings.wte(idx)
-        pos_emb = self.transformer_embeddings.wpe(pos)
-        x = self.transformer_embeddings.drop(tok_emb + pos_emb)
-        
-        # Apply pipeline stages
-        num_gpus = torch.cuda.device_count()
-        for stage_id, stage in enumerate(self.pipeline_stages):
-            gpu_id = stage_id % num_gpus
-            x = x.to(f'cuda:{gpu_id}')
+        try:
+            # Determine the embeddings device (first pipeline stage)
+            embeddings_device = next(self.transformer_embeddings.parameters()).device
             
-            for block in stage:
-                if use_recompute and self.training:
-                    x = checkpoint(block, x, use_reentrant=False)
+            # Move input and position tensors to embeddings device
+            idx = idx.to(embeddings_device)
+            pos = torch.arange(0, t, dtype=torch.long, device=embeddings_device)
+            
+            tok_emb = self.transformer_embeddings.wte(idx)
+            pos_emb = self.transformer_embeddings.wpe(pos)
+            x = self.transformer_embeddings.drop(tok_emb + pos_emb)
+            
+            # Apply pipeline stages
+            for stage_id, stage in enumerate(self.pipeline_stages):
+                # Move to the device where this stage is located
+                if len(list(stage.parameters())) > 0:  # Check if stage has parameters
+                    stage_device = next(stage.parameters()).device
+                    x = x.to(stage_device)
+                
+                for block in stage:
+                    if use_recompute and self.training:
+                        x = checkpoint(block, x, use_reentrant=False)
+                    else:
+                        x = block(x)
+            
+            # Final stage: layer norm and language model head
+            final_device = next(self.transformer_final.parameters()).device
+            x = x.to(final_device)
+            x = self.transformer_final.ln_f(x)
+            
+            if targets is not None:
+                targets = targets.to(final_device)
+                logits = self.lm_head(x)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                return logits, loss
+            else:
+                # Inference optimization: only compute logits for the last position
+                logits = self.lm_head(x[:, [-1], :])
+                return logits, None
+                
+        except RuntimeError as e:
+            if "Expected all tensors to be on the same device" in str(e):
+                print(f"Device mismatch error in pipeline forward: {e}")
+                print("Attempting to place entire model on single device...")
+                # Fallback: move everything to the same device
+                device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+                self.to(device)
+                idx = idx.to(device)
+                if targets is not None:
+                    targets = targets.to(device)
+                pos = torch.arange(0, t, dtype=torch.long, device=device)
+                
+                # Simple forward pass without pipeline
+                tok_emb = self.transformer_embeddings.wte(idx)
+                pos_emb = self.transformer_embeddings.wpe(pos)
+                x = self.transformer_embeddings.drop(tok_emb + pos_emb)
+                
+                for stage in self.pipeline_stages:
+                    for block in stage:
+                        if use_recompute and self.training:
+                            x = checkpoint(block, x, use_reentrant=False)
+                        else:
+                            x = block(x)
+                
+                x = self.transformer_final.ln_f(x)
+                
+                if targets is not None:
+                    logits = self.lm_head(x)
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                    return logits, loss
                 else:
-                    x = block(x)
-        
-        # Final stage: layer norm and language model head
-        final_gpu = (len(self.pipeline_stages) - 1) % num_gpus
-        x = x.to(f'cuda:{final_gpu}')
-        x = self.transformer_final.ln_f(x)
-        
-        if targets is not None:
-            targets = targets.to(f'cuda:{final_gpu}')
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-            return logits, loss
-        else:
-            # Inference optimization: only compute logits for the last position
-            logits = self.lm_head(x[:, [-1], :])
-            return logits, None
+                    logits = self.lm_head(x[:, [-1], :])
+                    return logits, None
+            else:
+                raise  # Re-raise if it's a different error
     
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         """Configure optimizers with support for parallelism."""
