@@ -137,37 +137,35 @@ def visualize_results_gradio(metrics_list_global, config_list_global):
                         gpu_mems_avg.append(avg_mem)
                         has_gpu_data = True
             
-            # Plot individual GPU lines
-            gpu_colors = ['red', 'green', 'blue', 'orange', 'purple', 'brown', 'pink', 'cyan']
-            for gpu_idx, (gpu_id, data) in enumerate(gpu_data.items()):
-                meaningful_iters = [it for idx, it in enumerate(data['iters']) if data['mems'][idx] > 0.001]
-                meaningful_mem = [mem for mem in data['mems'] if mem > 0.001]
-                if meaningful_iters:
-                    gpu_color = gpu_colors[gpu_idx % len(gpu_colors)]
-                    # Create label indicating which parallelism type is used
-                    parallelism_types = []
-                    if use_data_parallel: parallelism_types.append("DP")
-                    if use_pipeline_parallel: parallelism_types.append("PP") 
-                    if use_tensor_parallel: parallelism_types.append("TP")
-                    parallelism_label = "+".join(parallelism_types)
-                    
-                    axs[2].plot(meaningful_iters, meaningful_mem, 
-                               label=f"R{i+1} GPU{gpu_id} ({parallelism_label})", color=gpu_color, 
-                               marker='.', markersize=2, alpha=0.6, linewidth=1, linestyle='-')
+            # Determine if we have multiple GPUs
+            num_gpus = len(gpu_data)
             
-            # Plot average line
-            meaningful_iters_avg = [it for idx, it in enumerate(iters_avg) if gpu_mems_avg[idx] > 0.001]
-            meaningful_mem_avg = [mem for mem in gpu_mems_avg if mem > 0.001]
-            if meaningful_iters_avg:
-                parallelism_types = []
-                if use_data_parallel: parallelism_types.append("DP")
-                if use_pipeline_parallel: parallelism_types.append("PP")
-                if use_tensor_parallel: parallelism_types.append("TP")
-                parallelism_label = "+".join(parallelism_types)
-                
-                axs[2].plot(meaningful_iters_avg, meaningful_mem_avg, 
-                           label=f"R{i+1} Average ({parallelism_label})", color=colors(i % colors.N), 
-                           marker='o', markersize=4, alpha=0.9, linewidth=2, linestyle='--')
+            # Create label indicating which parallelism type is used
+            parallelism_types = []
+            if use_data_parallel: parallelism_types.append("DP")
+            if use_pipeline_parallel: parallelism_types.append("PP") 
+            if use_tensor_parallel: parallelism_types.append("TP")
+            parallelism_label = "+".join(parallelism_types)
+            
+            if num_gpus > 1:
+                # Multiple GPUs: Plot only the average/mean line
+                meaningful_iters_avg = [it for idx, it in enumerate(iters_avg) if gpu_mems_avg[idx] > 0.001]
+                meaningful_mem_avg = [mem for mem in gpu_mems_avg if mem > 0.001]
+                if meaningful_iters_avg:
+                    axs[2].plot(meaningful_iters_avg, meaningful_mem_avg, 
+                               label=f"R{i+1} Mean ({parallelism_label})", color=colors(i % colors.N), 
+                               marker='o', markersize=4, alpha=0.9, linewidth=2, linestyle='-')
+            else:
+                # Single GPU: Plot the individual GPU line
+                gpu_colors = ['red', 'green', 'blue', 'orange', 'purple', 'brown', 'pink', 'cyan']
+                for gpu_idx, (gpu_id, data) in enumerate(gpu_data.items()):
+                    meaningful_iters = [it for idx, it in enumerate(data['iters']) if data['mems'][idx] > 0.001]
+                    meaningful_mem = [mem for mem in data['mems'] if mem > 0.001]
+                    if meaningful_iters:
+                        gpu_color = gpu_colors[gpu_idx % len(gpu_colors)]
+                        axs[2].plot(meaningful_iters, meaningful_mem, 
+                                   label=f"R{i+1} GPU{gpu_id} ({parallelism_label})", color=gpu_color, 
+                                   marker='.', markersize=3, alpha=0.8, linewidth=1, linestyle='-')
         else:
             # Standard single GPU or CPU mode
             iters_mem, gpu_mems = [], []
