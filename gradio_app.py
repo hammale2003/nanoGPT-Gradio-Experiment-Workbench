@@ -37,16 +37,15 @@ history = {
 
 def visualize_results_gradio(metrics_list_global, config_list_global):
     if not metrics_list_global:
-        fig, axs = plt.subplots(2, 2, figsize=(12, 8))
+        fig, axs = plt.subplots(4, 1, figsize=(12, 20))
         titles = ["Loss Curves vs. Iteration", "Time per Evaluation Interval", "Peak GPU Memory at Eval Points", "Final Validation Loss per Run"]
-        for i_row in range(2):
-            for j_col in range(2):
-                axs[i_row,j_col].text(0.5, 0.5, 'No data yet. Run training first.', ha='center', va='center', fontsize=9)
-                axs[i_row,j_col].set_title(titles[i_row*2+j_col], fontsize=10)
+        for i in range(4):
+            axs[i].text(0.5, 0.5, 'No data yet. Run training first.', ha='center', va='center', fontsize=9)
+            axs[i].set_title(titles[i], fontsize=12)
         plt.tight_layout()
         return fig, "No data to visualize yet. Please complete a training run."
     
-    fig, axs = plt.subplots(2, 2, figsize=(17, 12))
+    fig, axs = plt.subplots(4, 1, figsize=(14, 20))
     num_runs = len(metrics_list_global)
     try: colors = plt.cm.get_cmap('tab10', max(10, num_runs))
     except ValueError: colors = plt.cm.get_cmap('viridis', max(10, num_runs))
@@ -61,11 +60,13 @@ def visualize_results_gradio(metrics_list_global, config_list_global):
                    f"GA{run_config_summary.get('grad_accumulation_steps_direct_ui', '?')},"
                    f"RC{run_config_summary.get('use_recompute_ui', False)},"
                    f"DP{run_config_summary.get('use_data_parallel_ui', False)}")
-        if iters and val_l: axs[0, 0].plot(iters, val_l, label=f"{cfg_lbl} Val", color=colors(i % colors.N), linestyle='-', marker='.', markersize=5, alpha=0.9)
-        if iters and train_l_est: axs[0, 0].plot(iters, train_l_est, label=f"{cfg_lbl} TrainEst", color=colors(i % colors.N), linestyle='--', marker='x', markersize=5, alpha=0.9)
-    axs[0, 0].set_title("Loss Curves vs. Iteration", fontsize=11); axs[0, 0].set_xlabel("Iteration", fontsize=10); axs[0, 0].set_ylabel("Loss", fontsize=10)
-    if metrics_list_global: axs[0, 0].legend(fontsize='xx-small', loc='best', ncol=1)
-    axs[0, 0].grid(True, linestyle=':', alpha=0.7); axs[0, 0].tick_params(axis='both', which='major', labelsize=9)
+        if iters and val_l: axs[0].plot(iters, val_l, label=f"{cfg_lbl} Val", color=colors(i % colors.N), linestyle='-', marker='.', markersize=5, alpha=0.9)
+        if iters and train_l_est: axs[0].plot(iters, train_l_est, label=f"{cfg_lbl} TrainEst", color=colors(i % colors.N), linestyle='--', marker='x', markersize=5, alpha=0.9)
+    axs[0].set_title("Loss Curves vs. Iteration", fontsize=14); axs[0].set_xlabel("Iteration", fontsize=12); axs[0].set_ylabel("Loss", fontsize=12)
+    # Only add legend if there's actual data plotted
+    if metrics_list_global and any(len([m for m in run_metrics if m['type'] == 'eval' and 'iter' in m and 'val_loss' in m]) > 0 for run_metrics, _ in zip(metrics_list_global, config_list_global)):
+        axs[0].legend(fontsize='small', loc='best', ncol=1)
+    axs[0].grid(True, linestyle=':', alpha=0.7); axs[0].tick_params(axis='both', which='major', labelsize=10)
 
     # Plot 2: Time per Evaluation Interval
     for i, (run_metrics, _) in enumerate(zip(metrics_list_global, config_list_global)):
@@ -75,50 +76,154 @@ def visualize_results_gradio(metrics_list_global, config_list_global):
         if times:
             interval_t.append(times[0]); valid_iters_interval.append(iters[0])
             for j in range(1, len(times)): interval_t.append(times[j] - times[j-1]); valid_iters_interval.append(iters[j])
-        if valid_iters_interval and interval_t: axs[0, 1].plot(valid_iters_interval, interval_t, label=f"Run {i+1}", color=colors(i % colors.N), marker='.', markersize=5, alpha=0.9)
-    axs[0, 1].set_title("Time per Evaluation Interval", fontsize=11); axs[0, 1].set_xlabel("Iteration (end of interval)", fontsize=10); axs[0, 1].set_ylabel("Time (s)", fontsize=10)
-    if metrics_list_global: axs[0, 1].legend(fontsize='xx-small')
-    axs[0, 1].grid(True, linestyle=':', alpha=0.7); axs[0, 1].tick_params(axis='both', which='major', labelsize=9)
+        if valid_iters_interval and interval_t: axs[1].plot(valid_iters_interval, interval_t, label=f"Run {i+1}", color=colors(i % colors.N), marker='.', markersize=5, alpha=0.9)
+    axs[1].set_title("Time per Evaluation Interval", fontsize=14); axs[1].set_xlabel("Iteration (end of interval)", fontsize=12); axs[1].set_ylabel("Time (s)", fontsize=12)
+    # Only add legend if there's actual data plotted
+    if metrics_list_global and any(len([m for m in run_metrics if m['type'] == 'eval' and 'iter' in m and 'time_elapsed_total' in m]) > 0 for run_metrics, _ in zip(metrics_list_global, config_list_global)):
+        axs[1].legend(fontsize='small')
+    axs[1].grid(True, linestyle=':', alpha=0.7); axs[1].tick_params(axis='both', which='major', labelsize=10)
 
-    # Plot 3: Peak GPU Memory
+    # Plot 3: Peak GPU Memory - Enhanced for ALL types of Parallelism
     has_gpu_data = False
-    for i, (run_metrics, _) in enumerate(zip(metrics_list_global, config_list_global)):
-        iters_mem, gpu_mems = [], []
-        for m in run_metrics:
-            if m['type'] == 'train_iter' and 'gpu_mem_gb_max_iter' in m: iters_mem.append(m['iter']); gpu_mems.append(m['gpu_mem_gb_max_iter']); has_gpu_data = True
-            elif m['type'] == 'eval' and 'gpu_mem_gb_current_eval' in m and m['iter'] not in iters_mem: iters_mem.append(m['iter']); gpu_mems.append(m['gpu_mem_gb_current_eval']); has_gpu_data = True
-        if iters_mem:
-            pts = sorted(zip(iters_mem, gpu_mems)); s_iters = [p[0] for p in pts]; s_mem = [p[1] for p in pts]
-            meaningful_iters = [it for idx, it in enumerate(s_iters) if s_mem[idx] > 0.001]; meaningful_mem = [mem for mem in s_mem if mem > 0.001]
-            if meaningful_iters: axs[1, 0].plot(meaningful_iters, meaningful_mem, label=f"Run {i+1}", color=colors(i % colors.N), marker='.', markersize=3, alpha=0.7, linewidth=0.8)
-    axs[1, 0].set_title("Peak GPU Memory Usage", fontsize=11); axs[1, 0].set_xlabel("Iteration", fontsize=10); axs[1, 0].set_ylabel("Memory (GB)", fontsize=10)
-    if has_gpu_data: axs[1, 0].legend(fontsize='xx-small')
-    else: axs[1, 0].text(0.5, 0.5, 'No GPU Memory data or GPU not used.', ha='center', va='center', fontsize=9, color='gray', wrap=True)
-    axs[1, 0].grid(True, linestyle=':', alpha=0.7); axs[1, 0].tick_params(axis='both', which='major', labelsize=9)
+    for i, (run_metrics, run_config_summary) in enumerate(zip(metrics_list_global, config_list_global)):
+        # Check if ANY type of parallelism is enabled
+        use_data_parallel = run_config_summary.get('use_data_parallel_ui', False)
+        use_pipeline_parallel = run_config_summary.get('use_pipeline_parallel_ui', False)
+        use_tensor_parallel = run_config_summary.get('use_tensor_parallel_ui', False)
+        use_any_parallelism = use_data_parallel or use_pipeline_parallel or use_tensor_parallel
+        
+        if use_any_parallelism:
+            # For any parallelism type, show individual GPU lines + average
+            gpu_data = {}  # gpu_id -> {iters: [], mems: []}
+            iters_avg, gpu_mems_avg = [], []
+            
+            for m in run_metrics:
+                if m['type'] == 'train_iter' and 'gpu_mem_per_gpu' in m:
+                    iter_num = m['iter']
+                    gpu_mem_data = m['gpu_mem_per_gpu']  # dict: {gpu_id: mem_gb}
+                    
+                    # Collect data for each GPU
+                    for gpu_id, mem_gb in gpu_mem_data.items():
+                        if gpu_id not in gpu_data:
+                            gpu_data[gpu_id] = {'iters': [], 'mems': []}
+                        gpu_data[gpu_id]['iters'].append(iter_num)
+                        gpu_data[gpu_id]['mems'].append(mem_gb)
+                    
+                    # Calculate average for this iteration
+                    if gpu_mem_data:
+                        avg_mem = sum(gpu_mem_data.values()) / len(gpu_mem_data)
+                        iters_avg.append(iter_num)
+                        gpu_mems_avg.append(avg_mem)
+                        has_gpu_data = True
+                
+                elif m['type'] == 'eval' and 'gpu_mem_per_gpu_eval' in m:
+                    iter_num = m['iter']
+                    gpu_mem_data = m['gpu_mem_per_gpu_eval']  # dict: {gpu_id: mem_gb}
+                    
+                    # Collect data for each GPU
+                    for gpu_id, mem_gb in gpu_mem_data.items():
+                        if gpu_id not in gpu_data:
+                            gpu_data[gpu_id] = {'iters': [], 'mems': []}
+                        if iter_num not in gpu_data[gpu_id]['iters']:
+                            gpu_data[gpu_id]['iters'].append(iter_num)
+                            gpu_data[gpu_id]['mems'].append(mem_gb)
+                    
+                    # Calculate average for this iteration
+                    if gpu_mem_data and iter_num not in iters_avg:
+                        avg_mem = sum(gpu_mem_data.values()) / len(gpu_mem_data)
+                        iters_avg.append(iter_num)
+                        gpu_mems_avg.append(avg_mem)
+                        has_gpu_data = True
+            
+            # Plot individual GPU lines
+            gpu_colors = ['red', 'green', 'blue', 'orange', 'purple', 'brown', 'pink', 'cyan']
+            for gpu_idx, (gpu_id, data) in enumerate(gpu_data.items()):
+                meaningful_iters = [it for idx, it in enumerate(data['iters']) if data['mems'][idx] > 0.001]
+                meaningful_mem = [mem for mem in data['mems'] if mem > 0.001]
+                if meaningful_iters:
+                    gpu_color = gpu_colors[gpu_idx % len(gpu_colors)]
+                    # Create label indicating which parallelism type is used
+                    parallelism_types = []
+                    if use_data_parallel: parallelism_types.append("DP")
+                    if use_pipeline_parallel: parallelism_types.append("PP") 
+                    if use_tensor_parallel: parallelism_types.append("TP")
+                    parallelism_label = "+".join(parallelism_types)
+                    
+                    axs[2].plot(meaningful_iters, meaningful_mem, 
+                               label=f"R{i+1} GPU{gpu_id} ({parallelism_label})", color=gpu_color, 
+                               marker='.', markersize=2, alpha=0.6, linewidth=1, linestyle='-')
+            
+            # Plot average line
+            meaningful_iters_avg = [it for idx, it in enumerate(iters_avg) if gpu_mems_avg[idx] > 0.001]
+            meaningful_mem_avg = [mem for mem in gpu_mems_avg if mem > 0.001]
+            if meaningful_iters_avg:
+                parallelism_types = []
+                if use_data_parallel: parallelism_types.append("DP")
+                if use_pipeline_parallel: parallelism_types.append("PP")
+                if use_tensor_parallel: parallelism_types.append("TP")
+                parallelism_label = "+".join(parallelism_types)
+                
+                axs[2].plot(meaningful_iters_avg, meaningful_mem_avg, 
+                           label=f"R{i+1} Average ({parallelism_label})", color=colors(i % colors.N), 
+                           marker='o', markersize=4, alpha=0.9, linewidth=2, linestyle='--')
+        else:
+            # Standard single GPU or CPU mode
+            iters_mem, gpu_mems = [], []
+            for m in run_metrics:
+                if m['type'] == 'train_iter' and 'gpu_mem_gb_max_iter' in m: 
+                    iters_mem.append(m['iter']); gpu_mems.append(m['gpu_mem_gb_max_iter']); has_gpu_data = True
+                elif m['type'] == 'eval' and 'gpu_mem_gb_current_eval' in m and m['iter'] not in iters_mem: 
+                    iters_mem.append(m['iter']); gpu_mems.append(m['gpu_mem_gb_current_eval']); has_gpu_data = True
+            
+            if iters_mem:
+                pts = sorted(zip(iters_mem, gpu_mems)); s_iters = [p[0] for p in pts]; s_mem = [p[1] for p in pts]
+                meaningful_iters = [it for idx, it in enumerate(s_iters) if s_mem[idx] > 0.001]
+                meaningful_mem = [mem for mem in s_mem if mem > 0.001]
+                if meaningful_iters: 
+                    axs[2].plot(meaningful_iters, meaningful_mem, label=f"Run {i+1} (Standard)", color=colors(i % colors.N), 
+                               marker='.', markersize=3, alpha=0.7, linewidth=0.8)
+    
+    axs[2].set_title("Peak GPU Memory Usage", fontsize=14); axs[2].set_xlabel("Iteration", fontsize=12); axs[2].set_ylabel("Memory (GB)", fontsize=12)
+    # Only add legend if there's actual GPU data and lines plotted
+    if has_gpu_data and axs[2].get_lines():
+        axs[2].legend(fontsize='x-small', loc='best')
+    elif not has_gpu_data:
+        axs[2].text(0.5, 0.5, 'No GPU Memory data or GPU not used.', ha='center', va='center', fontsize=9, color='gray', wrap=True)
+    axs[2].grid(True, linestyle=':', alpha=0.7); axs[2].tick_params(axis='both', which='major', labelsize=10)
 
     # Plot 4: Final Validation Losses
     run_lbls, final_val_losses, valid_indices_bar = [], [], []
     for i, (run_metrics, run_cfg) in enumerate(zip(metrics_list_global, config_list_global)):
         eval_m = [m for m in run_metrics if m['type'] == 'eval' and 'val_loss' in m and not np.isnan(m['val_loss'])]
+        
+        # Create comprehensive label with all parallelism types
+        parallelism_info = []
+        if run_cfg.get('use_recompute_ui', False): parallelism_info.append("RC")
+        if run_cfg.get('use_data_parallel_ui', False): parallelism_info.append("DP")
+        if run_cfg.get('use_pipeline_parallel_ui', False): parallelism_info.append("PP")
+        if run_cfg.get('use_tensor_parallel_ui', False): parallelism_info.append("TP")
+        parallelism_label = "+".join(parallelism_info) if parallelism_info else "None"
+        
         lbl_txt = (f"R{i+1}\nμB{run_cfg.get('micro_batch_size_ui','?')},"f"GA{run_cfg.get('grad_accumulation_steps_direct_ui','?')}\n"
-                   f"RC:{run_cfg.get('use_recompute_ui',False)},DP:{run_cfg.get('use_data_parallel_ui',False)}")
+                   f"Parallelism: {parallelism_label}")
         run_lbls.append(lbl_txt)
         if eval_m: final_val_losses.append(eval_m[-1]['val_loss']); valid_indices_bar.append(i)
         else: final_val_losses.append(np.nan)
     if valid_indices_bar:
         f_lbls = [run_lbls[i] for i in valid_indices_bar]; f_losses = [final_val_losses[i] for i in valid_indices_bar]
         x_idx = np.arange(len(f_lbls)); bar_w = max(0.1, min(0.6, 0.5 / (len(f_lbls) / 5 + 1)))
-        bars = axs[1, 1].bar(x_idx, f_losses, bar_w, color=[colors(i % colors.N) for i in valid_indices_bar])
-        axs[1, 1].set_xticks(x_idx); axs[1, 1].set_xticklabels(f_lbls, rotation=45, ha="right", fontsize=7)
+        bars = axs[3].bar(x_idx, f_losses, bar_w, color=[colors(i % colors.N) for i in valid_indices_bar])
+        axs[3].set_xticks(x_idx); axs[3].set_xticklabels(f_lbls, rotation=45, ha="right", fontsize=8)
         if f_losses:
             max_l_val = max(filter(lambda x: not np.isnan(x), f_losses), default=1.0)
             for bar_idx, bar_item in enumerate(bars):
                 yval = bar_item.get_height()
-                if not np.isnan(yval): axs[1,1].text(bar_item.get_x() + bar_item.get_width()/2.0, yval + 0.02 * max_l_val , f'{yval:.3f}', ha='center', va='bottom', fontsize=6)
-    else: axs[1,1].text(0.5, 0.5, 'No final validation loss data.', ha='center', va='center', fontsize=9, color='gray')
-    axs[1, 1].set_title("Final Validation Loss per Run", fontsize=11); axs[1, 1].set_ylabel("Loss", fontsize=10)
-    axs[1, 1].grid(True, axis='y', linestyle=':', alpha=0.7); axs[1, 1].tick_params(axis='y', which='major', labelsize=9)
-    plt.tight_layout(pad=2.0, h_pad=2.5, w_pad=2.0)
+                if not np.isnan(yval): axs[3].text(bar_item.get_x() + bar_item.get_width()/2.0, yval + 0.02 * max_l_val , f'{yval:.3f}', ha='center', va='bottom', fontsize=8)
+    else: axs[3].text(0.5, 0.5, 'No final validation loss data.', ha='center', va='center', fontsize=9, color='gray')
+    axs[3].set_title("Final Validation Loss per Run", fontsize=14); axs[3].set_ylabel("Loss", fontsize=12)
+    axs[3].grid(True, axis='y', linestyle=':', alpha=0.7); axs[3].tick_params(axis='y', which='major', labelsize=10)
+    
+    plt.tight_layout(pad=3.0, h_pad=3.0)
     return fig, "Plots updated based on all runs in history."
 
 def analyze_results_gradio(metrics_list_global, config_list_global):
@@ -130,8 +235,16 @@ def analyze_results_gradio(metrics_list_global, config_list_global):
         analysis += f"    - Effective BS (calc): `{run_cfg.get('batch_size_effective_calculated', 'N/A')}`\n"
         analysis += f"    - Micro-BS: `{run_cfg.get('micro_batch_size_ui', 'N/A')}`\n"
         analysis += f"    - Grad Accum Steps: `{run_cfg.get('grad_accumulation_steps_direct_ui', 'N/A')}`\n"
-        analysis += f"    - Recompute: `{'On' if run_cfg.get('use_recompute_ui', False) else 'Off'}`\n"
-        analysis += f"    - DataParallel: `{'On' if run_cfg.get('use_data_parallel_ui', False) else 'Off'}`\n"
+        
+        # Enhanced parallelism information
+        parallelism_info = []
+        if run_cfg.get('use_recompute_ui', False): parallelism_info.append("Gradient Checkpointing")
+        if run_cfg.get('use_data_parallel_ui', False): parallelism_info.append("Data Parallelism")
+        if run_cfg.get('use_pipeline_parallel_ui', False): parallelism_info.append("Pipeline Parallelism")
+        if run_cfg.get('use_tensor_parallel_ui', False): parallelism_info.append("Tensor Parallelism")
+        parallelism_used = ", ".join(parallelism_info) if parallelism_info else "None"
+        
+        analysis += f"    - Parallelism Techniques: `{parallelism_used}`\n"
         analysis += f"    - Max Iters: `{run_cfg.get('max_iters_ui', 'N/A')}`\n"
         eval_m = [m for m in run_metrics if m['type'] == 'eval' and 'val_loss' in m and not np.isnan(m['val_loss'])]
         final_prog_update = run_metrics[-1] if run_metrics else {}
@@ -141,6 +254,11 @@ def analyze_results_gradio(metrics_list_global, config_list_global):
         max_gpu = 0.0;
         for m_item in run_metrics: max_gpu = max(max_gpu, m_item.get('gpu_mem_gb_max',0.0), m_item.get('gpu_mem_gb_max_iter',0.0), m_item.get('gpu_mem_gb_max_overall',0.0), m_item.get('gpu_mem_gb_current_eval',0.0))
         if max_gpu > 0.001: analysis += f"    - Peak GPU Memory: `{max_gpu:.2f} GB`\n"
+        
+        # Add information about per-GPU tracking if any parallelism was used
+        if any([run_cfg.get('use_data_parallel_ui', False), run_cfg.get('use_pipeline_parallel_ui', False), run_cfg.get('use_tensor_parallel_ui', False)]):
+            analysis += f"    - 📊 **Per-GPU memory tracking enabled** (see individual GPU lines in plots)\n"
+        
         analysis += "\n---\n"
     return analysis
 
@@ -250,23 +368,103 @@ def create_gradio_interface():
         analysis = analyze_results_gradio(history["metrics_list"], history["config_list"])
         return fig, analysis
 
-    with gr.Blocks(title="nanoGPT Optimization Workbench", theme=gr.themes.Soft(primary_hue=gr.themes.colors.blue, secondary_hue=gr.themes.colors.sky)) as demo:
-        gr.Markdown("# nanoGPT Optimization Experiment Workbench")
+    # CSS pour supprimer les bordures SAUF pour les graphiques
+    custom_css = """
+    /* SUPPRESSION DES BORDURES SAUF GRAPHIQUES */
+    * {
+        border: none !important;
+        outline: none !important;
+        box-shadow: none !important;
+        animation: none !important;
+        border-radius: 0 !important;
+    }
+    
+    *:focus, *:hover, *:active, *:visited {
+        border: none !important;
+        outline: none !important;
+        box-shadow: none !important;
+        animation: none !important;
+        border-radius: 0 !important;
+    }
+    
+    .gradio-container, .gradio-container * {
+        border: none !important;
+        outline: none !important;
+        box-shadow: none !important;
+        animation: none !important;
+        border-radius: 0 !important;
+    }
+    
+    .gradio-container *:focus, .gradio-container *:hover, .gradio-container *:active {
+        border: none !important;
+        outline: none !important;
+        box-shadow: none !important;
+        animation: none !important;
+        border-radius: 0 !important;
+    }
+    
+    /* Suppression spécifique pour les éléments NON-graphiques */
+    div:not([data-testid="plot"]):not(.plot-container), 
+    span, section, article, main, aside, nav, header, footer, form, fieldset, legend, input, textarea, select, button, label {
+        border: none !important;
+        outline: none !important;
+        box-shadow: none !important;
+        border-radius: 0 !important;
+    }
+    
+    /* Cibler tous les éléments avec des classes contenant certains mots SAUF plots */
+    [class*="border"]:not([data-testid="plot"]):not(.plot-container), 
+    [class*="rounded"]:not([data-testid="plot"]):not(.plot-container), 
+    [class*="shadow"]:not([data-testid="plot"]):not(.plot-container), 
+    [class*="outline"]:not([data-testid="plot"]):not(.plot-container), 
+    [class*="ring"]:not([data-testid="plot"]):not(.plot-container) {
+        border: none !important;
+        outline: none !important;
+        box-shadow: none !important;
+        border-radius: 0 !important;
+    }
+    
+    /* AJOUTER DES BORDURES POUR LES GRAPHIQUES SEULEMENT */
+    .gradio-container [data-testid="plot"],
+    .gradio-container .plot-container,
+    .gradio-container [data-testid="plot"] > div,
+    .gradio-container .plot-container > div {
+        border: 2px solid #2563eb !important;
+        border-radius: 8px !important;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1) !important;
+        padding: 8px !important;
+        margin: 4px 0 !important;
+    }
+    
+    /* Hover effect pour les graphiques */
+    .gradio-container [data-testid="plot"]:hover,
+    .gradio-container .plot-container:hover {
+        border-color: #1d4ed8 !important;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.15) !important;
+    }
+    """
+    
+    with gr.Blocks(title="nanoGPT Parallelism Workbench", 
+                   theme=gr.themes.Soft(primary_hue=gr.themes.colors.blue, secondary_hue=gr.themes.colors.sky),
+                   css=custom_css) as demo:
+        gr.Markdown("#  nanoGPT Parallelism Workbench")
+        #gr.Markdown("## **Now with REAL implementations of all parallelism techniques!**")
+        #gr.Markdown("✅ **Gradient Checkpointing** | ✅ **Pipeline Parallelism** | ✅ **Tensor Parallelism** | ✅ **Data Parallelism**")
         with gr.Tabs() as tabs:
             with gr.TabItem("⚙️ Configuration & Live Training", id="config_tab"):
                 with gr.Row(equal_height=False):
                     with gr.Column(scale=1, min_width=400):
-                        gr.Markdown("### nanoGPT Model & Dataset")
-                        dataset_name_ui = gr.Dropdown(label="Dataset", choices=["shakespeare_char", "openwebtext", "shakespeare"], value="shakespeare_char", interactive=True)
-                        block_size_ui = gr.Slider(minimum=32, maximum=1024, step=32, value=256, label="Block Size", interactive=True)
-                        vocab_size_ui = gr.Number(value=50304, label="Vocab Size (overridden by meta.pkl if exists)", interactive=True)
-                        n_layer_ui = gr.Slider(minimum=1, maximum=48, step=1, value=6, label="Layers", interactive=True)
-                        n_head_ui = gr.Slider(minimum=1, maximum=25, step=1, value=6, label="Heads", interactive=True)
-                        n_embd_ui = gr.Slider(minimum=64, maximum=1600, step=32, value=384, label="Embedding Dim", interactive=True)
-                        dropout_ui = gr.Slider(minimum=0.0, maximum=0.5, step=0.01, value=0.2, label="Dropout", interactive=True)
-                        bias_ui = gr.Checkbox(value=False, label="Bias in Linear Layers?", interactive=True)
+                        gr.Markdown("### nanoGPT Model & Dataset (Fixed)")
+                        dataset_name_ui = gr.Dropdown(label="Dataset", choices=["shakespeare_char", "openwebtext", "shakespeare"], value="shakespeare_char", interactive=False)
+                        block_size_ui = gr.Number(value=256, label="Block Size", interactive=False)
+                        vocab_size_ui = gr.Number(value=50304, label="Vocab Size (overridden by meta.pkl if exists)", interactive=False)
+                        n_layer_ui = gr.Number(value=6, label="Layers", interactive=False)
+                        n_head_ui = gr.Number(value=6, label="Heads", interactive=False)
+                        n_embd_ui = gr.Number(value=384, label="Embedding Dim", interactive=False)
+                        dropout_ui = gr.Number(value=0.2, label="Dropout", interactive=False)
+                        bias_ui = gr.Checkbox(value=False, label="Bias in Linear Layers?", interactive=False)
                         
-                        gr.Markdown("### Training Hyperparameters")
+                        gr.Markdown("### Training Hyperparameters (Adjustable)")
                         micro_batch_size_ui = gr.Slider(minimum=1, maximum=128, step=1, value=8, label="Micro-Batch Size (per GPU/fwd pass)", interactive=True)
                         grad_accumulation_steps_direct_ui = gr.Slider(minimum=1, maximum=64, step=1, value=5, label="Gradient Accumulation Steps", interactive=True)
                         effective_batch_size_display = gr.Textbox(label="Effective Batch Size (Calculated)", interactive=False, placeholder="Updates automatically")
@@ -282,14 +480,21 @@ def create_gradio_interface():
                             lr_decay_iters_ui = gr.Slider(minimum=10, maximum=20000, step=10, value=2000, label="LR Decay Iterations (auto-capped at max_iters)", interactive=True)
                             min_lr_ui = gr.Textbox(value="6e-5", label="Minimum Learning Rate", interactive=True)
 
-                        gr.Markdown("### Optimization Techniques")
-                        use_recompute_ui = gr.Checkbox(label="Activation Recomputation (Checkpointing)", value=False, interactive=True)
-                        use_data_parallel_ui = gr.Checkbox(label="Data Parallelism (nn.DataParallel - if >1 GPU)", value=torch.cuda.is_available() and torch.cuda.device_count() > 1, interactive=True)
-                        use_pipeline_parallel_ui = gr.Checkbox(label="Pipeline Parallelism (Flag Only - Not Implemented)", value=False, interactive=True) 
-                        use_tensor_parallel_ui = gr.Checkbox(label="Tensor Parallelism (Flag Only - Not Implemented)", value=False, interactive=True) 
+                        gr.Markdown("### Optimization Techniques (Adjustable)")
+                       
+                        use_recompute_ui = gr.Checkbox(label="Gradient Checkpointing (Activation Recomputation)", value=False, interactive=True)
                         
-                        gr.Markdown("### Logging & Output")
-                        out_dir_gradio_ui = gr.Textbox(value="out-gradio-run", label="Output SubDirectory (relative to app location)", interactive=True)
+                        #gr.Markdown("💡 **Data Parallelism**: Replicates model across GPUs, each processes different batches.")
+                        use_data_parallel_ui = gr.Checkbox(label="Data Parallelism (nn.DataParallel - enables per-GPU memory tracking)", value=torch.cuda.is_available() and torch.cuda.device_count() > 1, interactive=True)
+                        
+                        #gr.Markdown("💡 **Pipeline Parallelism**: Splits model layers across GPUs - each GPU processes different layers.")
+                        use_pipeline_parallel_ui = gr.Checkbox(label="Pipeline Parallelism", value=False, interactive=True)
+                        
+                        #gr.Markdown("💡 **Tensor Parallelism**: Splits operations within layers across GPUs - each GPU processes part of each operation.")
+                        use_tensor_parallel_ui = gr.Checkbox(label="Tensor Parallelism", value=False, interactive=True)
+                        
+                        gr.Markdown("### Logging & Output (Adjustable)")
+                        out_dir_gradio_ui = gr.Textbox(value="out-gradio-run", label="Output SubDirectory (relative to app location)", interactive=False)
                         log_interval_gradio_ui = gr.Slider(minimum=1, maximum=100, step=1, value=10, label="Log Interval (Iterations)", interactive=True)
                         eval_interval_gradio_ui = gr.Slider(minimum=10, maximum=1000, step=10, value=100, label="Evaluation Interval (Iterations)", interactive=True)
                         eval_iters_gradio_ui = gr.Slider(minimum=1, maximum=200, step=1, value=20, label="Eval Iterations (for loss estimation)", interactive=True)
@@ -298,12 +503,14 @@ def create_gradio_interface():
                             clear_button = gr.Button("🧹 Clear All Run History", scale=1)
                     with gr.Column(scale=2, min_width=600):
                         gr.Markdown("### Live Training Progress")
-                        status_label_ui = gr.Label(value="Ready. Configure and Launch.", label="Current Status")
-                        live_plot_output_ui = gr.Plot(label="Current Run: Loss Curve & GPU Memory") 
-                        progress_log_ui = gr.Textbox(label="Training Log Stream (Latest First)", lines=15, max_lines=30, interactive=False, autoscroll=False)
+                        gr.Markdown("** GPU Memory Tracking**: When ANY parallelism is enabled (Data/Pipeline/Tensor), the GPU Memory plot will show individual lines for each GPU plus the average.")
+                     
+                        status_label_ui = gr.Label(value="Ready. Configure and Launch.", container=False)
+                        live_plot_output_ui = gr.Plot(container=False) 
+                        progress_log_ui = gr.Textbox(label="Training Log Stream (Latest First)", lines=15, max_lines=30, interactive=False, autoscroll=False, container=False)
             with gr.TabItem("📊 Comparative Results & Analysis (All Runs)", id="results_tab"):
-                gr.Markdown("### Aggregated Results Across All Runs in This Session")
-                overall_plot_output_ui = gr.Plot(label="Comparison Plots Across All Runs") # This will be cleared by clear_button
+                #gr.Markdown("### Aggregated Results Across All Runs in This Session")
+                overall_plot_output_ui = gr.Plot(container=False) # This will be cleared by clear_button
                 overall_analysis_output_ui = gr.Markdown(label="Automated Analysis of All Runs") # This will be cleared by clear_button via run_training_interface_generator's yield
                 refresh_button = gr.Button("🔄 Refresh Overall Plots & Analysis")
                 gr.Markdown("*Note: Plots and analysis here update after each run completes or when this refresh button is clicked.*")
@@ -342,17 +549,30 @@ def create_gradio_interface():
         return demo
 
 if __name__ == "__main__":
-    print("Starting Gradio Application for nanoGPT Optimization Experiments...")
+    print("🚀 Starting Advanced nanoGPT Parallelism Workbench...")
+    print("✅ REAL implementations now available for:")
+    print("   - Gradient Checkpointing (Activation Recomputation)")
+    print("   - Pipeline Parallelism (Layer distribution)")
+    print("   - Tensor Parallelism (Operation splitting)")
+    print("   - Data Parallelism (Model replication)")
     print(f"PyTorch version: {torch.__version__}")
     print(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         print(f"Number of GPUs available: {torch.cuda.device_count()}")
-        for i in range(torch.cuda.device_count()): print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
-    else: print("CUDA not available, running on CPU. Data Parallelism will be disabled if selected.")
+        for i in range(torch.cuda.device_count()): 
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+        print(f"💡 With {torch.cuda.device_count()} GPUs, you can now use:")
+        if torch.cuda.device_count() >= 2:
+            print("   - Pipeline Parallelism (layers across GPUs)")
+            print("   - Tensor Parallelism (operations across GPUs)")
+        print("   - Data Parallelism (model replication)")
+        print("   - Gradient Checkpointing (memory optimization)")
+    else: 
+        print("CUDA not available, running on CPU.")
+        print("⚠️  Advanced parallelism features require CUDA GPUs.")
     
     gradio_app_instance = create_gradio_interface()
     try:
-        # share=True might require `gradio tunnel` or can be intermittent. Set to False for local-only.
-        gradio_app_instance.launch(share=True, debug=True) # Changed share to False for robustness in typical local env
+        gradio_app_instance.launch(share=True, debug=True)
     except Exception as e:
         print(f"Error launching Gradio app: {e}")
