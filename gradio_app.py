@@ -58,10 +58,24 @@ def visualize_results_gradio(metrics_list_global, config_list_global):
         iters = [m['iter'] for m in eval_data]
         val_l = [m['val_loss'] for m in eval_data]
         train_l_est = [m['train_loss_est'] for m in eval_data]
-        cfg_lbl = (f"R{i+1} μB{run_config_summary.get('micro_batch_size_ui', '?')},"
-                   f"GA{run_config_summary.get('grad_accumulation_steps_direct_ui', '?')},"
-                   f"RC{run_config_summary.get('use_recompute_ui', False)},"
-                   f"DP{run_config_summary.get('use_data_parallel_ui', False)}")
+        
+        # Create comprehensive parallelism label
+        parallelism_techniques = []
+        if run_config_summary.get('use_recompute_ui', False): 
+            parallelism_techniques.append("Checkpointing")
+        if run_config_summary.get('use_data_parallel_ui', False): 
+            parallelism_techniques.append("Data∥")
+        if run_config_summary.get('use_pipeline_parallel_ui', False): 
+            parallelism_techniques.append("Pipeline∥")
+        if run_config_summary.get('use_tensor_parallel_ui', False): 
+            parallelism_techniques.append("Tensor∥")
+        
+        parallelism_label = "+".join(parallelism_techniques) if parallelism_techniques else "Standard"
+        
+        cfg_lbl = (f"R{i+1}: {parallelism_label} "
+                   f"(μB{run_config_summary.get('micro_batch_size_ui', '?')}, "
+                   f"GA{run_config_summary.get('grad_accumulation_steps_direct_ui', '?')})")
+        
         if iters and val_l: axs[0].plot(iters, val_l, label=f"{cfg_lbl} Val", color=colors(i % colors.N), linestyle='-', marker='.', markersize=5, alpha=0.9)
         if iters and train_l_est: axs[0].plot(iters, train_l_est, label=f"{cfg_lbl} TrainEst", color=colors(i % colors.N), linestyle='--', marker='x', markersize=5, alpha=0.9)
     axs[0].set_title("Loss Curves vs. Iteration", fontsize=14); axs[0].set_xlabel("Iteration", fontsize=12); axs[0].set_ylabel("Loss", fontsize=12)
@@ -142,9 +156,9 @@ def visualize_results_gradio(metrics_list_global, config_list_global):
             
             # Create label indicating which parallelism type is used
             parallelism_types = []
-            if use_data_parallel: parallelism_types.append("DP")
-            if use_pipeline_parallel: parallelism_types.append("PP") 
-            if use_tensor_parallel: parallelism_types.append("TP")
+            if use_data_parallel: parallelism_types.append("Data∥")
+            if use_pipeline_parallel: parallelism_types.append("Pipeline∥") 
+            if use_tensor_parallel: parallelism_types.append("Tensor∥")
             parallelism_label = "+".join(parallelism_types)
             
             if num_gpus > 1:
@@ -153,7 +167,7 @@ def visualize_results_gradio(metrics_list_global, config_list_global):
                 meaningful_mem_avg = [mem for mem in gpu_mems_avg if mem > 0.001]
                 if meaningful_iters_avg:
                     axs[2].plot(meaningful_iters_avg, meaningful_mem_avg, 
-                               label=f"R{i+1} Mean ({parallelism_label})", color=colors(i % colors.N), 
+                               label=f"R{i+1}: {parallelism_label} Mean", color=colors(i % colors.N), 
                                marker='o', markersize=4, alpha=0.9, linewidth=2, linestyle='-')
             else:
                 # Single GPU: Plot the individual GPU line
@@ -164,7 +178,7 @@ def visualize_results_gradio(metrics_list_global, config_list_global):
                     if meaningful_iters:
                         gpu_color = gpu_colors[gpu_idx % len(gpu_colors)]
                         axs[2].plot(meaningful_iters, meaningful_mem, 
-                                   label=f"R{i+1} GPU{gpu_id} ({parallelism_label})", color=gpu_color, 
+                                   label=f"R{i+1}: {parallelism_label} GPU{gpu_id}", color=gpu_color, 
                                    marker='.', markersize=3, alpha=0.8, linewidth=1, linestyle='-')
         else:
             # Standard single GPU or CPU mode
@@ -198,14 +212,15 @@ def visualize_results_gradio(metrics_list_global, config_list_global):
         
         # Create comprehensive label with all parallelism types
         parallelism_info = []
-        if run_cfg.get('use_recompute_ui', False): parallelism_info.append("RC")
-        if run_cfg.get('use_data_parallel_ui', False): parallelism_info.append("DP")
-        if run_cfg.get('use_pipeline_parallel_ui', False): parallelism_info.append("PP")
-        if run_cfg.get('use_tensor_parallel_ui', False): parallelism_info.append("TP")
-        parallelism_label = "+".join(parallelism_info) if parallelism_info else "None"
+        if run_cfg.get('use_recompute_ui', False): parallelism_info.append("Checkpointing")
+        if run_cfg.get('use_data_parallel_ui', False): parallelism_info.append("Data∥")
+        if run_cfg.get('use_pipeline_parallel_ui', False): parallelism_info.append("Pipeline∥")
+        if run_cfg.get('use_tensor_parallel_ui', False): parallelism_info.append("Tensor∥")
+        parallelism_label = "+".join(parallelism_info) if parallelism_info else "Standard"
         
-        lbl_txt = (f"R{i+1}\nμB{run_cfg.get('micro_batch_size_ui','?')},"f"GA{run_cfg.get('grad_accumulation_steps_direct_ui','?')}\n"
-                   f"Parallelism: {parallelism_label}")
+        lbl_txt = (f"R{i+1}: {parallelism_label}\n"
+                   f"μB{run_cfg.get('micro_batch_size_ui','?')}, "
+                   f"GA{run_cfg.get('grad_accumulation_steps_direct_ui','?')}")
         run_lbls.append(lbl_txt)
         if eval_m: final_val_losses.append(eval_m[-1]['val_loss']); valid_indices_bar.append(i)
         else: final_val_losses.append(np.nan)
@@ -242,7 +257,7 @@ def analyze_results_gradio(metrics_list_global, config_list_global):
         if run_cfg.get('use_data_parallel_ui', False): parallelism_info.append("Data Parallelism")
         if run_cfg.get('use_pipeline_parallel_ui', False): parallelism_info.append("Pipeline Parallelism")
         if run_cfg.get('use_tensor_parallel_ui', False): parallelism_info.append("Tensor Parallelism")
-        parallelism_used = ", ".join(parallelism_info) if parallelism_info else "None"
+        parallelism_used = ", ".join(parallelism_info) if parallelism_info else "Standard (no parallelism)"
         
         analysis += f"    - Parallelism Techniques: `{parallelism_used}`\n"
         analysis += f"    - Max Iters: `{run_cfg.get('max_iters_ui', 'N/A')}`\n"
@@ -576,3 +591,5 @@ if __name__ == "__main__":
         gradio_app_instance.launch(share=True, debug=True)
     except Exception as e:
         print(f"Error launching Gradio app: {e}")
+
+
