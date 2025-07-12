@@ -302,6 +302,11 @@ def run_nanoGPT_training(
                     yield {"type": "info", "message": f"✅ Pipeline parallelism confirmed - model distributed across {pipeline_parallel_size} GPUs"}
                 else:
                     yield {"type": "info", "message": f"⚠️  Pipeline parallelism setup issue - model appears to be on single device"}
+            
+            # Check weight tying status for pipeline parallelism
+            if hasattr(model, 'weights_tied'):
+                tying_status = "enabled" if model.weights_tied else "disabled (normal for pipeline parallelism)"
+                yield {"type": "info", "message": f"🔗 Weight tying {tying_status}"}
         else:
             yield {"type": "info", "message": "⚠️  Pipeline Parallelism requested but using single GPU (need more GPUs)"}
     
