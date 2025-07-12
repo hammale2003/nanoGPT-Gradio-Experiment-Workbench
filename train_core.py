@@ -19,7 +19,7 @@ if current_script_dir not in sys.path:
 
 try:
     # Try to import the modified model with all parallelism support
-    from model_with_checkpointing import GPTConfig, GPT
+    from model_with_checkpointing import GPTConfig, GPT, GPTWithSingleProcessPipeline
     print("✅ Using advanced GPT model with REAL implementations of:")
     print("   - Gradient Checkpointing (Activation Recomputation)")
     print("   - Pipeline Parallelism") 
@@ -27,6 +27,7 @@ try:
 except ImportError:
     try:
         from nanoGPT.model import GPTConfig, GPT
+        GPTWithSingleProcessPipeline = None
         print("⚠️  Warning: Using original nanoGPT model without advanced parallelism support!")
     except ImportError as e:
         print(f"CRITICAL ERROR: Could not import from 'nanoGPT.model'.")
@@ -163,17 +164,14 @@ def run_nanoGPT_training(
     except:
         dist_available = False
     
-    # Only enable advanced parallelism if distributed is properly initialized
-    # For single-process mode, we'll use fallback implementations
+    # Configure parallelism - allow pipeline parallelism even without distributed
+    pipeline_parallel_size = min(num_gpus, 2) if use_pipeline_parallel_ui and num_gpus > 1 else 1
+    
+    # Tensor parallelism requires distributed communication, so keep the restriction
     if dist_available:
-        pipeline_parallel_size = min(num_gpus, 2) if use_pipeline_parallel_ui and num_gpus > 1 else 1
         tensor_parallel_size = min(num_gpus, 2) if use_tensor_parallel_ui and num_gpus > 1 else 1
     else:
-        # In single-process mode, disable advanced parallelism that requires distributed communication
-        pipeline_parallel_size = 1
         tensor_parallel_size = 1
-        if use_pipeline_parallel_ui and num_gpus > 1:
-            print("⚠️  Pipeline Parallelism requires distributed initialization - falling back to single-process mode")
         if use_tensor_parallel_ui and num_gpus > 1:
             print("⚠️  Tensor Parallelism requires distributed initialization - falling back to single-process mode")
     
@@ -255,10 +253,16 @@ def run_nanoGPT_training(
     
     # Initialize model with parallelism configuration
     try:
-        # Try to use advanced model with parallelism
-        pipeline_rank = 0  # For now, we'll use rank 0 (single-process training)
-        tensor_parallel_rank = 0
-        model = GPT(gptconf, pipeline_rank=pipeline_rank, tensor_parallel_rank=tensor_parallel_rank)
+        # Choose the appropriate model based on parallelism configuration
+        if pipeline_parallel_size > 1 and not dist_available and GPTWithSingleProcessPipeline is not None:
+            # Use single-process pipeline parallelism
+            tensor_parallel_rank = 0
+            model = GPTWithSingleProcessPipeline(gptconf, tensor_parallel_rank=tensor_parallel_rank)
+        else:
+            # Use advanced model with distributed parallelism or standard model
+            pipeline_rank = 0  # For now, we'll use rank 0 (single-process training)
+            tensor_parallel_rank = 0
+            model = GPT(gptconf, pipeline_rank=pipeline_rank, tensor_parallel_rank=tensor_parallel_rank)
     except TypeError:
         # Fallback to original model if advanced features not available
         model = GPT(gptconf)
@@ -274,12 +278,11 @@ def run_nanoGPT_training(
             yield {"type": "info", "message": "⚠️  Tensor Parallelism requested but using single GPU (need more GPUs or distributed setup)"}
     
     if use_pipeline_parallel_ui: 
-        if pipeline_parallel_size > 1 and dist_available:
-            yield {"type": "info", "message": f"✅ Pipeline Parallelism ENABLED - Using {pipeline_parallel_size} GPUs for pipeline stages"}
-        elif not dist_available:
-            yield {"type": "info", "message": "⚠️  Pipeline Parallelism requested but distributed not initialized - using single-process fallback"}
+        if pipeline_parallel_size > 1:
+            mode = "distributed" if dist_available else "single-process"
+            yield {"type": "info", "message": f"✅ Pipeline Parallelism ENABLED - Using {pipeline_parallel_size} GPUs in {mode} mode"}
         else:
-            yield {"type": "info", "message": "⚠️  Pipeline Parallelism requested but using single GPU (need more GPUs or distributed setup)"}
+            yield {"type": "info", "message": "⚠️  Pipeline Parallelism requested but using single GPU (need more GPUs)"}
     
     if use_recompute_ui: 
         yield {"type": "info", "message": "✅ Gradient Checkpointing ENABLED - Memory usage will be reduced during training!"}
@@ -296,7 +299,9 @@ def run_nanoGPT_training(
     if (use_data_parallel_ui or use_pipeline_parallel_ui or use_tensor_parallel_ui) and num_gpus > 1:
         yield {"type": "info", "message": f"📊 Per-GPU memory tracking enabled for {num_gpus} GPUs - Individual GPU lines will appear in plots!"}
     
-    model.to(device)
+    # Move model to device (for single-process pipeline, this is handled in the model initialization)
+    if not (pipeline_parallel_size > 1 and not dist_available):
+        model.to(device)
     
     optimizer = model_for_optimizer.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device)
     
@@ -418,3 +423,6 @@ def run_nanoGPT_training(
     final_max_mem = max_mem_gb if device == 'cuda' else 0.0
     yield {"type": "finished", "message": f"Training finished!", "best_val_loss": best_val_loss,
            "time_elapsed_total": final_elapsed_time, "gpu_mem_gb_max_overall": final_max_mem}
+
+
+
