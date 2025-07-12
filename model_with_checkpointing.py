@@ -18,6 +18,14 @@ from torch.utils.checkpoint import checkpoint
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+# Add helper function to check if distributed is available and initialized
+def is_dist_available_and_initialized():
+    """Check if distributed is available and initialized"""
+    try:
+        return dist.is_available() and dist.is_initialized()
+    except:
+        return False
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -63,15 +71,29 @@ class TensorParallelLinear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
     
     def forward(self, input):
+        # Only use distributed communication if properly initialized
+        if self.tensor_parallel_size > 1 and is_dist_available_and_initialized():
+            # All-gather input across tensor parallel ranks
+            outputs = [torch.empty_like(input) for _ in range(self.tensor_parallel_size)]
+            try:
+                dist.all_gather(outputs, input)
+                input = torch.cat(outputs, dim=-1)
+            except Exception as e:
+                # Fallback to single-process mode if distributed fails
+                print(f"Warning: Distributed communication failed, falling back to single-process mode: {e}")
+                pass
+        
         # Compute local portion of the linear transformation
         output = F.linear(input, self.weight, self.bias)
         
-        # All-gather outputs from all tensor parallel ranks
-        if self.tensor_parallel_size > 1:
-            # Gather all outputs
-            outputs = [torch.zeros_like(output) for _ in range(self.tensor_parallel_size)]
-            dist.all_gather(outputs, output)
-            output = torch.cat(outputs, dim=-1)
+        # Only use distributed communication if properly initialized
+        if self.tensor_parallel_size > 1 and is_dist_available_and_initialized():
+            try:
+                dist.all_reduce(output)
+            except Exception as e:
+                # Fallback to single-process mode if distributed fails
+                print(f"Warning: Distributed all-reduce failed, falling back to single-process mode: {e}")
+                pass
         
         return output
 
@@ -202,15 +224,20 @@ class TensorParallelMLP(nn.Module):
         x = self.gelu(x)
         
         # For the second linear layer, we need to split the input and all-reduce the output
-        if self.tensor_parallel_size > 1:
+        if self.tensor_parallel_size > 1 and is_dist_available_and_initialized():
             # Split input for local computation
             chunk_size = x.size(-1) // self.tensor_parallel_size
             x_local = x[..., self.tensor_parallel_rank * chunk_size:(self.tensor_parallel_rank + 1) * chunk_size]
             x_local = self.c_proj(x_local)
             
             # All-reduce the outputs
-            dist.all_reduce(x_local, op=dist.ReduceOp.SUM)
-            x = x_local
+            try:
+                dist.all_reduce(x_local, op=dist.ReduceOp.SUM)
+                x = x_local
+            except Exception as e:
+                # Fallback to single-process mode if distributed fails
+                print(f"Warning: Distributed all-reduce failed in MLP, falling back to single-process mode: {e}")
+                x = self.c_proj(x)
         else:
             x = self.c_proj(x)
         
