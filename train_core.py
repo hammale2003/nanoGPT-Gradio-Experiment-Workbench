@@ -444,5 +444,3 @@ def run_nanoGPT_training(
     final_max_mem = max_mem_gb if device == 'cuda' else 0.0
     yield {"type": "finished", "message": f"Training finished!", "best_val_loss": best_val_loss,
            "time_elapsed_total": final_elapsed_time, "gpu_mem_gb_max_overall": final_max_mem}
-
-S
