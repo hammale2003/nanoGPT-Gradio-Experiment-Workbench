@@ -47,8 +47,10 @@ def visualize_results_gradio(metrics_list_global, config_list_global):
     
     fig, axs = plt.subplots(4, 1, figsize=(14, 20))
     num_runs = len(metrics_list_global)
-    try: colors = plt.cm.get_cmap('tab10', max(10, num_runs))
-    except ValueError: colors = plt.cm.get_cmap('viridis', max(10, num_runs))
+    try: colors = plt.colormaps.get_cmap('tab10') if num_runs <= 10 else plt.colormaps.get_cmap('tab20')
+    except (ValueError, AttributeError): 
+        try: colors = plt.cm.get_cmap('tab10', max(10, num_runs))
+        except ValueError: colors = plt.cm.get_cmap('viridis', max(10, num_runs))
 
     # Plot 1: Loss Curves
     for i, (run_metrics, run_config_summary) in enumerate(zip(metrics_list_global, config_list_global)):
@@ -503,7 +505,7 @@ def create_gradio_interface():
                             clear_button = gr.Button("🧹 Clear All Run History", scale=1)
                     with gr.Column(scale=2, min_width=600):
                         gr.Markdown("### Live Training Progress")
-                        gr.Markdown("** GPU Memory Tracking**: When ANY parallelism is enabled (Data/Pipeline/Tensor), the GPU Memory plot will show individual lines for each GPU plus the average.")
+                        #gr.Markdown("GPU Memory Tracking*: When ANY parallelism is enabled (Data/Pipeline/Tensor), the GPU Memory plot will show individual lines for each GPU plus the average.")
                      
                         status_label_ui = gr.Label(value="Ready. Configure and Launch.", container=False)
                         live_plot_output_ui = gr.Plot(container=False) 
