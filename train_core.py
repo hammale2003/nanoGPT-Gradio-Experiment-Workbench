@@ -84,6 +84,91 @@ def get_gpu_memory_per_gpu():
     
     return gpu_memory
 
+# --- Helper function to initialize distributed for tensor parallelism ---
+def initialize_distributed_for_tensor_parallelism(num_gpus):
+    """
+    Initialize PyTorch distributed for tensor parallelism if not already initialized.
+    This is needed for tensor parallelism to work with multi-GPU communication.
+    """
+    try:
+        # Check if distributed is already initialized
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            print("✅ PyTorch distributed already initialized")
+            return True
+        
+        if not torch.distributed.is_available():
+            print("⚠️  PyTorch distributed not available in this installation")
+            print("   Install PyTorch with NCCL support for tensor parallelism")
+            return False
+        
+        if num_gpus < 2:
+            print("⚠️  Need at least 2 GPUs for tensor parallelism")
+            return False
+        
+        # Initialize distributed with NCCL backend for GPU communication
+        print("🔄 Initializing PyTorch distributed for tensor parallelism...")
+        
+        # Set environment variables for single-machine multi-GPU
+        import os
+        
+        # Use a unique port to avoid conflicts
+        import random
+        master_port = str(12355 + random.randint(0, 1000))
+        
+        # Set required environment variables
+        env_vars = {
+            'MASTER_ADDR': 'localhost',
+            'MASTER_PORT': master_port,
+            'WORLD_SIZE': '1',
+            'RANK': '0',
+            'LOCAL_RANK': '0',
+            'NCCL_DEBUG': 'WARN'  # For debugging NCCL issues
+        }
+        
+        for key, value in env_vars.items():
+            os.environ[key] = value
+            
+        print(f"   Using MASTER_PORT: {master_port}")
+        
+        # Initialize the process group with timeout
+        torch.distributed.init_process_group(
+            backend='nccl',
+            init_method='env://',
+            world_size=1,
+            rank=0,
+            timeout=torch.distributed.default_pg_timeout  # Use default timeout
+        )
+        
+        # Verify initialization worked
+        if torch.distributed.is_initialized():
+            print("✅ PyTorch distributed initialized successfully for tensor parallelism")
+            
+            # Test basic communication
+            test_tensor = torch.zeros(1).cuda()
+            torch.distributed.all_reduce(test_tensor)
+            print("✅ Distributed communication test successful")
+            
+            return True
+        else:
+            print("❌ Distributed initialization appeared to succeed but is not actually initialized")
+            return False
+        
+    except Exception as e:
+        print(f"❌ Failed to initialize PyTorch distributed: {e}")
+        
+        # Provide helpful error messages for common issues
+        error_str = str(e).lower()
+        if 'nccl' in error_str:
+            print("   💡 NCCL error - this might be a driver/CUDA compatibility issue")
+            print("   Try: export NCCL_DEBUG=INFO for more details")
+        elif 'timeout' in error_str:
+            print("   💡 Timeout error - GPUs might not be able to communicate")
+        elif 'address already in use' in error_str:
+            print("   💡 Port conflict - will try different port on next attempt")
+        
+        print("   Tensor parallelism will fall back to single-process mode")
+        return False
+
 # --- Default Configuration ---
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' if torch.cuda.is_available() else 'float32'
@@ -174,16 +259,22 @@ def run_nanoGPT_training(
     except:
         dist_available = False
     
+    # If tensor parallelism is requested and distributed is not initialized, try to initialize it
+    if use_tensor_parallel_ui and num_gpus > 1 and not dist_available:
+        print("🔄 Tensor Parallelism requested - attempting to initialize PyTorch distributed...")
+        dist_available = initialize_distributed_for_tensor_parallelism(num_gpus)
+    
     # Configure parallelism - allow pipeline parallelism even without distributed
     pipeline_parallel_size = min(num_gpus, 2) if use_pipeline_parallel_ui and num_gpus > 1 else 1
     
-    # Tensor parallelism requires distributed communication, so keep the restriction
+    # Tensor parallelism configuration
     if dist_available:
         tensor_parallel_size = min(num_gpus, 2) if use_tensor_parallel_ui and num_gpus > 1 else 1
     else:
         tensor_parallel_size = 1
         if use_tensor_parallel_ui and num_gpus > 1:
-            print("⚠️  Tensor Parallelism requires distributed initialization - falling back to single-process mode")
+            print("⚠️  Tensor Parallelism requested but distributed initialization failed")
+            print("   Falling back to single-process mode (no tensor parallelism)")
     
     # Ensure we don't exceed available GPUs
     total_parallel_gpus = pipeline_parallel_size * tensor_parallel_size
@@ -266,26 +357,55 @@ def run_nanoGPT_training(
         # Choose the appropriate model based on parallelism configuration
         if pipeline_parallel_size > 1 and not dist_available and GPTWithSingleProcessPipeline is not None:
             # Use single-process pipeline parallelism
+            print("🔄 Using GPTWithSingleProcessPipeline for pipeline parallelism")
             tensor_parallel_rank = 0
             model = GPTWithSingleProcessPipeline(gptconf, tensor_parallel_rank=tensor_parallel_rank)
-        else:
-            # Use advanced model with distributed parallelism or standard model
+        elif (tensor_parallel_size > 1 or pipeline_parallel_size > 1) and dist_available:
+            # Use advanced model with distributed parallelism
+            print("🔄 Using GPTWithAdvancedParallelism for distributed tensor/pipeline parallelism")
             pipeline_rank = 0  # For now, we'll use rank 0 (single-process training)
             tensor_parallel_rank = 0
+            from model_with_checkpointing import GPTWithAdvancedParallelism
+            model = GPTWithAdvancedParallelism(gptconf, pipeline_rank=pipeline_rank, tensor_parallel_rank=tensor_parallel_rank)
+        else:
+            # Use standard model for single-GPU or when advanced features are not available
+            print("🔄 Using standard GPT model")
+            pipeline_rank = 0
+            tensor_parallel_rank = 0
             model = GPT(gptconf, pipeline_rank=pipeline_rank, tensor_parallel_rank=tensor_parallel_rank)
-    except TypeError:
+    except TypeError as e:
+        print(f"⚠️  Model initialization error: {e}")
         # Fallback to original model if advanced features not available
-        model = GPT(gptconf)
-        print("⚠️  Using standard model initialization (advanced parallelism not available)")
+        try:
+            model = GPT(gptconf)
+            print("✅ Using standard model initialization (no parallelism features)")
+        except Exception as e2:
+            # Last resort: try importing the original nanoGPT model
+            print(f"❌ Standard model failed too: {e2}")
+            try:
+                from nanoGPT.model import GPT as OriginalGPT
+                model = OriginalGPT(gptconf)
+                print("✅ Using original nanoGPT model (emergency fallback)")
+            except Exception as e3:
+                yield {"type": "error", "message": f"All model initialization attempts failed: {e3}"}
+                return
+    except Exception as e:
+        print(f"❌ Unexpected model initialization error: {e}")
+        yield {"type": "error", "message": f"Model initialization failed: {e}"}
+        return
 
     # Parallelism status messages
     if use_tensor_parallel_ui: 
         if tensor_parallel_size > 1 and dist_available:
             yield {"type": "info", "message": f"✅ Tensor Parallelism ENABLED - Using {tensor_parallel_size} GPUs for tensor operations"}
-        elif not dist_available:
-            yield {"type": "info", "message": "⚠️  Tensor Parallelism requested but distributed not initialized - using single-process fallback"}
+            yield {"type": "info", "message": f"🔗 PyTorch distributed initialized for multi-GPU communication"}
+        elif use_tensor_parallel_ui and num_gpus > 1 and not dist_available:
+            yield {"type": "info", "message": "⚠️  Tensor Parallelism requested but PyTorch distributed initialization failed"}
+            yield {"type": "info", "message": "   Using standard training instead (consider checking NCCL/CUDA setup)"}
+        elif use_tensor_parallel_ui and num_gpus <= 1:
+            yield {"type": "info", "message": "⚠️  Tensor Parallelism requested but only 1 GPU available"}
         else:
-            yield {"type": "info", "message": "⚠️  Tensor Parallelism requested but using single GPU (need more GPUs or distributed setup)"}
+            yield {"type": "info", "message": "⚠️  Tensor Parallelism setup issue - using standard training"}
     
     if use_pipeline_parallel_ui: 
         if pipeline_parallel_size > 1:
